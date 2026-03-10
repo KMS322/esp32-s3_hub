@@ -1,0 +1,1812 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_bt.h"
+
+// WiFi 관련 헤더 추가
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+
+// HTTP 클라이언트 헤더 추가
+#include "esp_http_client.h"
+
+#include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include "esp_bt_defs.h"
+#include "esp_bt_main.h"
+#include "esp_gatt_common_api.h"
+
+#include "sdkconfig.h"
+
+#define GATTS_TAG "GATTS_DEMO"
+
+// WiFi 관련 상수 추가
+#define WIFI_SSID_MAX_LEN 32
+#define WIFI_PASSWORD_MAX_LEN 64
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+///Declare the static function
+static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+
+#define GATTS_SERVICE_UUID_TEST_A   0x00FF
+#define GATTS_CHAR_UUID_TEST_A      0xFF01
+#define GATTS_DESCR_UUID_TEST_A     0x3333
+#define GATTS_NUM_HANDLE_TEST_A     4
+
+#define GATTS_SERVICE_UUID_TEST_B   0x00EE
+#define GATTS_CHAR_UUID_TEST_B      0xEE01
+#define GATTS_DESCR_UUID_TEST_B     0x2222
+#define GATTS_NUM_HANDLE_TEST_B     4
+
+static char test_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = "ESP_GATTS_DEMO";
+
+// WiFi credentials storage
+static char wifi_id[64] = {0};
+static char wifi_pw[64] = {0};
+
+// User email storage
+static char user_email[128] = {0};
+
+// Response message storage
+static char response_message[128] = {0};
+
+// HTTP 응답 저장
+static char http_response[512] = {0};
+static bool http_request_completed = false;
+
+// WiFi 관련 전역 변수 추가
+static EventGroupHandle_t s_wifi_event_group;
+static int s_retry_num = 0;
+static bool wifi_connected = false;
+static esp_gatt_if_t current_gatts_if = ESP_GATT_IF_NONE;
+static uint16_t current_conn_id = 0;
+static bool wifi_scan_done = false;
+static bool target_wifi_found = false;
+
+// WiFi function declarations
+void wifi_scan_on_boot(void);
+void connect_to_wifi(esp_gatt_if_t gatts_if, uint16_t conn_id);
+void send_wifi_success(esp_gatt_if_t gatts_if, uint16_t conn_id);
+void send_wifi_fail(esp_gatt_if_t gatts_if, uint16_t conn_id);
+bool check_wifi_credentials_exist(void);
+void wifi_scan_and_connect(esp_gatt_if_t gatts_if, uint16_t conn_id);
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+void wifi_init_sta(void);
+static void wifi_scan_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+
+// HTTP 클라이언트 함수 선언
+void send_http_request(void);
+static esp_err_t http_event_handler(esp_http_client_event_t *evt);
+void send_http_response(esp_gatt_if_t gatts_if, uint16_t conn_id, const char* response);
+
+
+#define TEST_MANUFACTURER_DATA_LEN  17
+
+#define GATTS_DEMO_CHAR_VAL_LEN_MAX 0x40
+
+#define PREPARE_BUF_MAX_SIZE 1024
+
+static uint8_t char1_str[] = {0x11,0x22,0x33};
+
+static uint16_t descr_value = 0x0;
+
+static uint16_t local_mtu = 23;
+
+static uint8_t char_value_read[CONFIG_EXAMPLE_CHAR_READ_DATA_LEN] = {0xDE,0xED,0xBE,0xEF};
+
+
+static esp_gatt_char_prop_t a_property = 0;
+static esp_gatt_char_prop_t b_property = 0;
+
+static esp_attr_value_t gatts_demo_char1_val =
+{
+    .attr_max_len = GATTS_DEMO_CHAR_VAL_LEN_MAX,
+    .attr_len     = sizeof(char1_str),
+    .attr_value   = char1_str,
+};
+
+static uint8_t adv_config_done = 0;
+#define adv_config_flag      (1 << 0)
+#define scan_rsp_config_flag (1 << 1)
+
+#ifdef CONFIG_EXAMPLE_SET_RAW_ADV_DATA
+static uint8_t raw_adv_data[] = {
+    /* Flags */
+    0x02, ESP_BLE_AD_TYPE_FLAG, 0x06,               // Length 2, Data Type ESP_BLE_AD_TYPE_FLAG, Data 1 (LE General Discoverable Mode, BR/EDR Not Supported)
+    /* TX Power Level */
+    0x02, ESP_BLE_AD_TYPE_TX_PWR, 0xEB,             // Length 2, Data Type ESP_BLE_AD_TYPE_TX_PWR, Data 2 (-21)
+    /* Complete 16-bit Service UUIDs */
+    0x03, ESP_BLE_AD_TYPE_16SRV_CMPL, 0xAB, 0xCD    // Length 3, Data Type ESP_BLE_AD_TYPE_16SRV_CMPL, Data 3 (UUID)
+};
+
+static uint8_t raw_scan_rsp_data[] = {
+    /* Complete Local Name */
+    0x0F, ESP_BLE_AD_TYPE_NAME_CMPL, 'E', 'S', 'P', '_', 'G', 'A', 'T', 'T', 'S', '_', 'D', 'E', 'M', 'O'   // Length 15, Data Type ESP_BLE_AD_TYPE_NAME_CMPL, Data (ESP_GATTS_DEMO)
+};
+#else
+
+static uint8_t adv_service_uuid128[32] = {
+    /* LSB <--------------------------------------------------------------------------------> MSB */
+    //first uuid, 16bit, [12],[13] is the value
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xEE, 0x00, 0x00, 0x00,
+    //second uuid, 32bit, [12], [13], [14], [15] is the value
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+};
+
+// The length of adv data must be less than 31 bytes
+//static uint8_t test_manufacturer[TEST_MANUFACTURER_DATA_LEN] =  {0x12, 0x23, 0x45, 0x56};
+//adv data
+static esp_ble_adv_data_t adv_data = {
+    .set_scan_rsp = false,
+    .include_name = true,
+    .include_txpower = false,
+    .min_interval = 0x0006, //slave connection min interval, Time = min_interval * 1.25 msec
+    .max_interval = 0x0010, //slave connection max interval, Time = max_interval * 1.25 msec
+    .appearance = 0x00,
+    .manufacturer_len = 0, //TEST_MANUFACTURER_DATA_LEN,
+    .p_manufacturer_data =  NULL, //&test_manufacturer[0],
+    .service_data_len = 0,
+    .p_service_data = NULL,
+    .service_uuid_len = sizeof(adv_service_uuid128),
+    .p_service_uuid = adv_service_uuid128,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+};
+// scan response data
+static esp_ble_adv_data_t scan_rsp_data = {
+    .set_scan_rsp = true,
+    .include_name = true,
+    .include_txpower = true,
+    //.min_interval = 0x0006,
+    //.max_interval = 0x0010,
+    .appearance = 0x00,
+    .manufacturer_len = 0, //TEST_MANUFACTURER_DATA_LEN,
+    .p_manufacturer_data =  NULL, //&test_manufacturer[0],
+    .service_data_len = 0,
+    .p_service_data = NULL,
+    .service_uuid_len = sizeof(adv_service_uuid128),
+    .p_service_uuid = adv_service_uuid128,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+};
+
+#endif /* CONFIG_SET_RAW_ADV_DATA */
+
+static esp_ble_adv_params_t adv_params = {
+    .adv_int_min        = 0x20,
+    .adv_int_max        = 0x40,
+    .adv_type           = ADV_TYPE_IND,
+    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
+    //.peer_addr            =
+    //.peer_addr_type       =
+    .channel_map        = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+};
+
+#define PROFILE_NUM 2
+#define PROFILE_A_APP_ID 0
+#define PROFILE_B_APP_ID 1
+
+struct gatts_profile_inst {
+    esp_gatts_cb_t gatts_cb;
+    uint16_t gatts_if;
+    uint16_t app_id;
+    uint16_t conn_id;
+    uint16_t service_handle;
+    esp_gatt_srvc_id_t service_id;
+    uint16_t char_handle;
+    esp_bt_uuid_t char_uuid;
+    esp_gatt_perm_t perm;
+    esp_gatt_char_prop_t property;
+    uint16_t descr_handle;
+    esp_bt_uuid_t descr_uuid;
+};
+
+/* One gatt-based profile one app_id and one gatts_if, this array will store the gatts_if returned by ESP_GATTS_REG_EVT */
+static struct gatts_profile_inst gl_profile_tab[PROFILE_NUM] = {
+    [PROFILE_A_APP_ID] = {
+        .gatts_cb = gatts_profile_a_event_handler,
+        .gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
+    },
+    [PROFILE_B_APP_ID] = {
+        .gatts_cb = gatts_profile_b_event_handler,                   /* This demo does not implement, similar as profile A */
+        .gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
+    },
+};
+
+typedef struct {
+    uint8_t                 *prepare_buf;
+    int                     prepare_len;
+} prepare_type_env_t;
+
+static prepare_type_env_t a_prepare_write_env;
+static prepare_type_env_t b_prepare_write_env;
+
+void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
+void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
+bool parse_wifi_command(const char* data, int len);
+void send_ok_response(esp_gatt_if_t gatts_if, uint16_t conn_id);
+void send_wifi_info(esp_gatt_if_t gatts_if, uint16_t conn_id);
+
+// WiFi 관련 함수 선언
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+void wifi_init_sta(void);
+void connect_to_wifi(esp_gatt_if_t gatts_if, uint16_t conn_id);
+void send_wifi_success(esp_gatt_if_t gatts_if, uint16_t conn_id);
+void send_wifi_fail(esp_gatt_if_t gatts_if, uint16_t conn_id);
+bool check_wifi_credentials_exist(void);
+void wifi_scan_and_connect(esp_gatt_if_t gatts_if, uint16_t conn_id);
+static void wifi_scan_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+#ifdef CONFIG_EXAMPLE_SET_RAW_ADV_DATA
+    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+        adv_config_done &= (~adv_config_flag);
+        if (adv_config_done==0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+    case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
+        adv_config_done &= (~scan_rsp_config_flag);
+        if (adv_config_done==0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+#else
+    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~adv_config_flag);
+        if (adv_config_done == 0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~scan_rsp_config_flag);
+        if (adv_config_done == 0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+#endif
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        //advertising start complete event to indicate advertising start successfully or failed
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(GATTS_TAG, "Advertising start failed, status %d", param->adv_start_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTS_TAG, "Advertising start successfully");
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(GATTS_TAG, "Advertising stop failed, status %d", param->adv_stop_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTS_TAG, "Advertising stop successfully");
+        break;
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+         ESP_LOGI(GATTS_TAG, "Connection params update, status %d, conn_int %d, latency %d, timeout %d",
+                  param->update_conn_params.status,
+                  param->update_conn_params.conn_int,
+                  param->update_conn_params.latency,
+                  param->update_conn_params.timeout);
+        break;
+    case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:
+        ESP_LOGI(GATTS_TAG, "Packet length update, status %d, rx %d, tx %d",
+                  param->pkt_data_length_cmpl.status,
+                  param->pkt_data_length_cmpl.params.rx_len,
+                  param->pkt_data_length_cmpl.params.tx_len);
+        break;
+    default:
+        break;
+    }
+}
+
+void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
+    esp_gatt_status_t status = ESP_GATT_OK;
+    if (param->write.need_rsp){
+        if (param->write.is_prep) {
+            if (param->write.offset > PREPARE_BUF_MAX_SIZE) {
+                status = ESP_GATT_INVALID_OFFSET;
+            } else if ((param->write.offset + param->write.len) > PREPARE_BUF_MAX_SIZE) {
+                status = ESP_GATT_INVALID_ATTR_LEN;
+            }
+            if (status == ESP_GATT_OK && prepare_write_env->prepare_buf == NULL) {
+                prepare_write_env->prepare_buf = (uint8_t *)malloc(PREPARE_BUF_MAX_SIZE*sizeof(uint8_t));
+                prepare_write_env->prepare_len = 0;
+                if (prepare_write_env->prepare_buf == NULL) {
+                    ESP_LOGE(GATTS_TAG, "Gatt_server prep no mem\n");
+                    status = ESP_GATT_NO_RESOURCES;
+                }
+            }
+
+            esp_gatt_rsp_t *gatt_rsp = (esp_gatt_rsp_t *)malloc(sizeof(esp_gatt_rsp_t));
+            gatt_rsp->attr_value.len = param->write.len;
+            gatt_rsp->attr_value.handle = param->write.handle;
+            gatt_rsp->attr_value.offset = param->write.offset;
+            gatt_rsp->attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
+            memcpy(gatt_rsp->attr_value.value, param->write.value, param->write.len);
+            esp_err_t response_err = esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, gatt_rsp);
+            if (response_err != ESP_OK){
+               ESP_LOGE(GATTS_TAG, "Send response error\n");
+            }
+            free(gatt_rsp);
+            if (status != ESP_GATT_OK){
+                return;
+            }
+            memcpy(prepare_write_env->prepare_buf + param->write.offset,
+                   param->write.value,
+                   param->write.len);
+            prepare_write_env->prepare_len += param->write.len;
+
+        }else{
+            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, NULL);
+        }
+    }
+}
+
+void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
+    if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC){
+        esp_log_buffer_hex(GATTS_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
+    }else{
+        ESP_LOGI(GATTS_TAG,"Prepare write cancel");
+    }
+    if (prepare_write_env->prepare_buf) {
+        free(prepare_write_env->prepare_buf);
+        prepare_write_env->prepare_buf = NULL;
+    }
+    prepare_write_env->prepare_len = 0;
+}
+
+static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    switch (event) {
+    case ESP_GATTS_REG_EVT:
+        ESP_LOGI(GATTS_TAG, "GATT server register, status %d, app_id %d, gatts_if %d", param->reg.status, param->reg.app_id, gatts_if);
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.is_primary = true;
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.id.inst_id = 0x00;
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.id.uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID_TEST_A;
+
+        esp_err_t set_dev_name_ret = esp_ble_gap_set_device_name(test_device_name);
+        if (set_dev_name_ret){
+            ESP_LOGE(GATTS_TAG, "set device name failed, error code = %x", set_dev_name_ret);
+        }
+#ifdef CONFIG_EXAMPLE_SET_RAW_ADV_DATA
+        esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(raw_adv_data, sizeof(raw_adv_data));
+        if (raw_adv_ret){
+            ESP_LOGE(GATTS_TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
+        }
+        adv_config_done |= adv_config_flag;
+        esp_err_t raw_scan_ret = esp_ble_gap_config_scan_rsp_data_raw(raw_scan_rsp_data, sizeof(raw_scan_rsp_data));
+        if (raw_scan_ret){
+            ESP_LOGE(GATTS_TAG, "config raw scan rsp data failed, error code = %x", raw_scan_ret);
+        }
+        adv_config_done |= scan_rsp_config_flag;
+#else
+        //config adv data
+        esp_err_t ret = esp_ble_gap_config_adv_data(&adv_data);
+        if (ret){
+            ESP_LOGE(GATTS_TAG, "config adv data failed, error code = %x", ret);
+        }
+        adv_config_done |= adv_config_flag;
+        //config scan response data
+        ret = esp_ble_gap_config_adv_data(&scan_rsp_data);
+        if (ret){
+            ESP_LOGE(GATTS_TAG, "config scan response data failed, error code = %x", ret);
+        }
+        adv_config_done |= scan_rsp_config_flag;
+
+#endif
+        esp_ble_gatts_create_service(gatts_if, &gl_profile_tab[PROFILE_A_APP_ID].service_id, GATTS_NUM_HANDLE_TEST_A);
+        break;
+    case ESP_GATTS_READ_EVT: {
+        ESP_LOGI(GATTS_TAG,
+                    "Characteristic read request: conn_id=%d, trans_id=%" PRIu32 ", handle=%d, is_long=%d, offset=%d, need_rsp=%d",
+                    param->read.conn_id, param->read.trans_id, param->read.handle,
+                    param->read.is_long, param->read.offset, param->read.need_rsp);
+
+        // If no response is needed, exit early (stack handles it automatically)
+        if (!param->read.need_rsp) {
+            return;
+        }
+
+        esp_gatt_rsp_t rsp;
+        memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+        rsp.attr_value.handle = param->read.handle;
+
+        // Handle descriptor read request
+        if (param->read.handle == gl_profile_tab[PROFILE_A_APP_ID].descr_handle) {
+            memcpy(rsp.attr_value.value, &descr_value, 2);
+            rsp.attr_value.len = 2;
+            esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
+            return;
+        }
+
+        // Handle characteristic read request
+        if (param->read.handle == gl_profile_tab[PROFILE_A_APP_ID].char_handle) {
+            uint16_t offset = param->read.offset;
+
+            // Validate read offset
+            if (param->read.is_long && offset > CONFIG_EXAMPLE_CHAR_READ_DATA_LEN) {
+                ESP_LOGW(GATTS_TAG, "Read offset (%d) out of range (0-%d)", offset, CONFIG_EXAMPLE_CHAR_READ_DATA_LEN);
+                rsp.attr_value.len = 0;
+                esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_INVALID_OFFSET, &rsp);
+                return;
+            }
+
+            // Determine response length based on MTU
+            uint16_t mtu_size = local_mtu - 1;  // ATT header (1 byte)
+            uint16_t send_len = (CONFIG_EXAMPLE_CHAR_READ_DATA_LEN - offset > mtu_size) ? mtu_size : (CONFIG_EXAMPLE_CHAR_READ_DATA_LEN - offset);
+
+            memcpy(rsp.attr_value.value, &char_value_read[offset], send_len);
+            rsp.attr_value.len = send_len;
+
+            // Send response to GATT client
+            esp_err_t err = esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
+            if (err != ESP_OK) {
+                ESP_LOGE(GATTS_TAG, "Failed to send response: %s", esp_err_to_name(err));
+            }
+        }
+        break;
+    }
+    case ESP_GATTS_WRITE_EVT: {
+        ESP_LOGI(GATTS_TAG, "*** BLE 데이터 수신 ***");
+        ESP_LOGI(GATTS_TAG, "길이: %d, 데이터: ", param->write.len);
+        ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
+        if (!param->write.is_prep){
+            
+            // Parse WiFi command from received data
+            ESP_LOGI(GATTS_TAG, "*** WiFi 명령 파싱 시작 ***");
+            bool wifi_parsed = parse_wifi_command((const char*)param->write.value, param->write.len);
+            
+            // Check for "check" command first
+            char command[256] = {0};
+            int copy_len = (param->write.len < 255) ? param->write.len : 255;
+            memcpy(command, param->write.value, copy_len);
+            command[copy_len] = '\0';
+            
+            // Remove leading/trailing whitespace for check command
+            char* trimmed_cmd = command;
+            while (*trimmed_cmd == ' ' || *trimmed_cmd == '\t' || *trimmed_cmd == '\r' || *trimmed_cmd == '\n') {
+                trimmed_cmd++;
+            }
+            
+            // Remove trailing whitespace too
+            char* end = trimmed_cmd + strlen(trimmed_cmd) - 1;
+            while (end > trimmed_cmd && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
+                *end = '\0';
+                end--;
+            }
+            
+            ESP_LOGI(GATTS_TAG, "Checking command: '%s'", trimmed_cmd);
+            
+            if (strcmp(trimmed_cmd, "check") == 0) {
+                ESP_LOGI(GATTS_TAG, "*** CHECK 명령 감지 ***");
+                // Send current WiFi info
+                send_wifi_info(gatts_if, param->write.conn_id);
+            } else if (wifi_parsed) {
+                ESP_LOGI(GATTS_TAG, "*** WiFi 파싱 성공, 직접 연결 시도 ***");
+                // WiFi 자격 증명이 파싱되었으면 WiFi 직접 연결 시도
+                connect_to_wifi(gatts_if, param->write.conn_id);
+            } else {
+                ESP_LOGI(GATTS_TAG, "*** 유효하지 않은 명령 ***");
+            }
+            
+            if (gl_profile_tab[PROFILE_A_APP_ID].descr_handle == param->write.handle && param->write.len == 2){
+                descr_value = param->write.value[1]<<8 | param->write.value[0];
+                if (descr_value == 0x0001){
+                    if (a_property & ESP_GATT_CHAR_PROP_BIT_NOTIFY){
+                        ESP_LOGI(GATTS_TAG, "Notification enable");
+                        // Disable automatic test data sending
+                        // uint8_t notify_data[15];
+                        // for (int i = 0; i < sizeof(notify_data); ++i)
+                        // {
+                        //     notify_data[i] = i%0xff;
+                        // }
+                        // //the size of notify_data[] need less than MTU size
+                        // esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                        //                         sizeof(notify_data), notify_data, false);
+                    }
+                }else if (descr_value == 0x0002){
+                    if (a_property & ESP_GATT_CHAR_PROP_BIT_INDICATE){
+                        ESP_LOGI(GATTS_TAG, "Indication enable");
+                        uint8_t indicate_data[15];
+                        for (int i = 0; i < sizeof(indicate_data); ++i)
+                        {
+                            indicate_data[i] = i%0xff;
+                        }
+                        //the size of indicate_data[] need less than MTU size
+                        esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                sizeof(indicate_data), indicate_data, true);
+                    }
+                }
+                else if (descr_value == 0x0000){
+                    ESP_LOGI(GATTS_TAG, "Notification/Indication disable");
+                }else{
+                    ESP_LOGE(GATTS_TAG, "Unknown descriptor value");
+                    ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
+                }
+
+            }
+        }
+        example_write_event_env(gatts_if, &a_prepare_write_env, param);
+        break;
+    }
+    case ESP_GATTS_EXEC_WRITE_EVT:
+        ESP_LOGI(GATTS_TAG,"Execute write");
+        esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+        example_exec_write_event_env(&a_prepare_write_env, param);
+        break;
+    case ESP_GATTS_MTU_EVT:
+        ESP_LOGI(GATTS_TAG, "MTU exchange, MTU %d", param->mtu.mtu);
+        local_mtu = param->mtu.mtu;
+        break;
+    case ESP_GATTS_UNREG_EVT:
+        break;
+    case ESP_GATTS_CREATE_EVT:
+        ESP_LOGI(GATTS_TAG, "Service create, status %d, service_handle %d", param->create.status, param->create.service_handle);
+        gl_profile_tab[PROFILE_A_APP_ID].service_handle = param->create.service_handle;
+        gl_profile_tab[PROFILE_A_APP_ID].char_uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_A_APP_ID].char_uuid.uuid.uuid16 = GATTS_CHAR_UUID_TEST_A;
+
+        esp_ble_gatts_start_service(gl_profile_tab[PROFILE_A_APP_ID].service_handle);
+        a_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+        esp_err_t add_char_ret = esp_ble_gatts_add_char(gl_profile_tab[PROFILE_A_APP_ID].service_handle, &gl_profile_tab[PROFILE_A_APP_ID].char_uuid,
+                                                        ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                                        a_property,
+                                                        &gatts_demo_char1_val, NULL);
+        if (add_char_ret){
+            ESP_LOGE(GATTS_TAG, "add char failed, error code =%x",add_char_ret);
+        }
+        break;
+    case ESP_GATTS_ADD_INCL_SRVC_EVT:
+        break;
+    case ESP_GATTS_ADD_CHAR_EVT: {
+        uint16_t length = 0;
+        const uint8_t *prf_char;
+
+        ESP_LOGI(GATTS_TAG, "Characteristic add, status %d, attr_handle %d, service_handle %d",
+                param->add_char.status, param->add_char.attr_handle, param->add_char.service_handle);
+        gl_profile_tab[PROFILE_A_APP_ID].char_handle = param->add_char.attr_handle;
+        gl_profile_tab[PROFILE_A_APP_ID].descr_uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_A_APP_ID].descr_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+        esp_err_t get_attr_ret = esp_ble_gatts_get_attr_value(param->add_char.attr_handle,  &length, &prf_char);
+        if (get_attr_ret == ESP_FAIL){
+            ESP_LOGE(GATTS_TAG, "ILLEGAL HANDLE");
+        }
+
+        ESP_LOGI(GATTS_TAG, "the gatts demo char length = %x\n", length);
+        for(int i = 0; i < length; i++){
+            ESP_LOGI(GATTS_TAG, "prf_char[%x] =%x\n",i,prf_char[i]);
+        }
+        esp_err_t add_descr_ret = esp_ble_gatts_add_char_descr(gl_profile_tab[PROFILE_A_APP_ID].service_handle, &gl_profile_tab[PROFILE_A_APP_ID].descr_uuid,
+                                                                ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, NULL, NULL);
+        if (add_descr_ret){
+            ESP_LOGE(GATTS_TAG, "add char descr failed, error code =%x", add_descr_ret);
+        }
+        break;
+    }
+    case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        gl_profile_tab[PROFILE_A_APP_ID].descr_handle = param->add_char_descr.attr_handle;
+        ESP_LOGI(GATTS_TAG, "Descriptor add, status %d, attr_handle %d, service_handle %d",
+                 param->add_char_descr.status, param->add_char_descr.attr_handle, param->add_char_descr.service_handle);
+        break;
+    case ESP_GATTS_DELETE_EVT:
+        break;
+    case ESP_GATTS_START_EVT:
+        ESP_LOGI(GATTS_TAG, "Service start, status %d, service_handle %d",
+                 param->start.status, param->start.service_handle);
+        break;
+    case ESP_GATTS_STOP_EVT:
+        break;
+    case ESP_GATTS_CONNECT_EVT: {
+        ESP_LOGI(GATTS_TAG, "*** BLE 연결됨 ***");
+        esp_ble_conn_update_params_t conn_params = {0};
+        memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        /* For the IOS system, please reference the apple official documents about the ble connection parameters restrictions. */
+        conn_params.latency = 0;
+        conn_params.max_int = 0x20;    // max_int = 0x20*1.25ms = 40ms
+        conn_params.min_int = 0x10;    // min_int = 0x10*1.25ms = 20ms
+        conn_params.timeout = 400;    // timeout = 400*10ms = 4000ms
+        ESP_LOGI(GATTS_TAG, "conn_id %u, remote "ESP_BD_ADDR_STR"",
+                 param->connect.conn_id, ESP_BD_ADDR_HEX(param->connect.remote_bda));
+        gl_profile_tab[PROFILE_A_APP_ID].conn_id = param->connect.conn_id;
+        //start sent the update connection parameters to the peer device.
+        esp_ble_gap_update_conn_params(&conn_params);
+        break;
+    }
+    case ESP_GATTS_DISCONNECT_EVT:
+        ESP_LOGI(GATTS_TAG, "*** BLE 연결 해제됨 ***");
+        ESP_LOGI(GATTS_TAG, "remote "ESP_BD_ADDR_STR", reason 0x%02x",
+                 ESP_BD_ADDR_HEX(param->disconnect.remote_bda), param->disconnect.reason);
+        esp_ble_gap_start_advertising(&adv_params);
+        local_mtu = 23; // Reset MTU for a single connection
+        break;
+    case ESP_GATTS_CONF_EVT:
+        ESP_LOGI(GATTS_TAG, "Confirm receive, status %d, attr_handle %d", param->conf.status, param->conf.handle);
+        if (param->conf.status != ESP_GATT_OK){
+            esp_log_buffer_hex(GATTS_TAG, param->conf.value, param->conf.len);
+        }
+        break;
+    case ESP_GATTS_OPEN_EVT:
+    case ESP_GATTS_CANCEL_OPEN_EVT:
+    case ESP_GATTS_CLOSE_EVT:
+    case ESP_GATTS_LISTEN_EVT:
+    case ESP_GATTS_CONGEST_EVT:
+    default:
+        break;
+    }
+}
+
+static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    switch (event) {
+    case ESP_GATTS_REG_EVT:
+        ESP_LOGI(GATTS_TAG, "GATT server register, status %d, app_id %d, gatts_if %d", param->reg.status, param->reg.app_id, gatts_if);
+        gl_profile_tab[PROFILE_B_APP_ID].service_id.is_primary = true;
+        gl_profile_tab[PROFILE_B_APP_ID].service_id.id.inst_id = 0x00;
+        gl_profile_tab[PROFILE_B_APP_ID].service_id.id.uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_B_APP_ID].service_id.id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID_TEST_B;
+
+        esp_ble_gatts_create_service(gatts_if, &gl_profile_tab[PROFILE_B_APP_ID].service_id, GATTS_NUM_HANDLE_TEST_B);
+        break;
+    case ESP_GATTS_READ_EVT: {
+        ESP_LOGI(GATTS_TAG, "Characteristic read, conn_id %d, trans_id %" PRIu32 ", handle %d", param->read.conn_id, param->read.trans_id, param->read.handle);
+        esp_gatt_rsp_t rsp;
+        memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+        rsp.attr_value.handle = param->read.handle;
+        rsp.attr_value.len = 4;
+        rsp.attr_value.value[0] = 0xde;
+        rsp.attr_value.value[1] = 0xed;
+        rsp.attr_value.value[2] = 0xbe;
+        rsp.attr_value.value[3] = 0xef;
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id,
+                                    ESP_GATT_OK, &rsp);
+        break;
+    }
+    case ESP_GATTS_WRITE_EVT: {
+        ESP_LOGI(GATTS_TAG, "Characteristic write, conn_id %d, trans_id %" PRIu32 ", handle %d", param->write.conn_id, param->write.trans_id, param->write.handle);
+        if (!param->write.is_prep){
+            ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
+            ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
+            if (gl_profile_tab[PROFILE_B_APP_ID].descr_handle == param->write.handle && param->write.len == 2){
+                uint16_t descr_value= param->write.value[1]<<8 | param->write.value[0];
+                if (descr_value == 0x0001){
+                    if (b_property & ESP_GATT_CHAR_PROP_BIT_NOTIFY) {
+                        ESP_LOGI(GATTS_TAG, "Notification enable");
+                        uint8_t notify_data[15];
+                        for (int i = 0; i < sizeof(notify_data); ++i)
+                        {
+                            notify_data[i] = i%0xff;
+                        }
+                        //the size of notify_data[] need less than MTU size
+                        esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, gl_profile_tab[PROFILE_B_APP_ID].char_handle,
+                                                sizeof(notify_data), notify_data, false);
+                    }
+                }else if (descr_value == 0x0002){
+                    if (b_property & ESP_GATT_CHAR_PROP_BIT_INDICATE){
+                        ESP_LOGI(GATTS_TAG, "Indication enable");
+                        uint8_t indicate_data[15];
+                        for (int i = 0; i < sizeof(indicate_data); ++i)
+                        {
+                            indicate_data[i] = i%0xff;
+                        }
+                        //the size of indicate_data[] need less than MTU size
+                        esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, gl_profile_tab[PROFILE_B_APP_ID].char_handle,
+                                                sizeof(indicate_data), indicate_data, true);
+                    }
+                }
+                else if (descr_value == 0x0000){
+                    ESP_LOGI(GATTS_TAG, "Notification/Indication disable");
+                }else{
+                    ESP_LOGE(GATTS_TAG, "Unknown value");
+                }
+
+            }
+        }
+        example_write_event_env(gatts_if, &b_prepare_write_env, param);
+        break;
+    }
+    case ESP_GATTS_EXEC_WRITE_EVT:
+        ESP_LOGI(GATTS_TAG,"Execute write");
+        esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+        example_exec_write_event_env(&b_prepare_write_env, param);
+        break;
+    case ESP_GATTS_MTU_EVT:
+        ESP_LOGI(GATTS_TAG, "MTU exchange, MTU %d", param->mtu.mtu);
+        break;
+    case ESP_GATTS_UNREG_EVT:
+        break;
+    case ESP_GATTS_CREATE_EVT:
+        ESP_LOGI(GATTS_TAG, "Service create, status %d,  service_handle %d", param->create.status, param->create.service_handle);
+        gl_profile_tab[PROFILE_B_APP_ID].service_handle = param->create.service_handle;
+        gl_profile_tab[PROFILE_B_APP_ID].char_uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_B_APP_ID].char_uuid.uuid.uuid16 = GATTS_CHAR_UUID_TEST_B;
+
+        esp_ble_gatts_start_service(gl_profile_tab[PROFILE_B_APP_ID].service_handle);
+        b_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+        esp_err_t add_char_ret =esp_ble_gatts_add_char( gl_profile_tab[PROFILE_B_APP_ID].service_handle, &gl_profile_tab[PROFILE_B_APP_ID].char_uuid,
+                                                        ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                                        b_property,
+                                                        NULL, NULL);
+        if (add_char_ret){
+            ESP_LOGE(GATTS_TAG, "add char failed, error code =%x",add_char_ret);
+        }
+        break;
+    case ESP_GATTS_ADD_INCL_SRVC_EVT:
+        break;
+    case ESP_GATTS_ADD_CHAR_EVT:
+        ESP_LOGI(GATTS_TAG, "Characteristic add, status %d, attr_handle %d, service_handle %d",
+                 param->add_char.status, param->add_char.attr_handle, param->add_char.service_handle);
+
+        gl_profile_tab[PROFILE_B_APP_ID].char_handle = param->add_char.attr_handle;
+        gl_profile_tab[PROFILE_B_APP_ID].descr_uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_B_APP_ID].descr_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+        esp_ble_gatts_add_char_descr(gl_profile_tab[PROFILE_B_APP_ID].service_handle, &gl_profile_tab[PROFILE_B_APP_ID].descr_uuid,
+                                     ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                     NULL, NULL);
+        break;
+    case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        gl_profile_tab[PROFILE_B_APP_ID].descr_handle = param->add_char_descr.attr_handle;
+        ESP_LOGI(GATTS_TAG, "Descriptor add, status %d, attr_handle %d, service_handle %d",
+                 param->add_char_descr.status, param->add_char_descr.attr_handle, param->add_char_descr.service_handle);
+        break;
+    case ESP_GATTS_DELETE_EVT:
+        break;
+    case ESP_GATTS_START_EVT:
+        ESP_LOGI(GATTS_TAG, "Service start, status %d, service_handle %d",
+                 param->start.status, param->start.service_handle);
+        break;
+    case ESP_GATTS_STOP_EVT:
+        break;
+    case ESP_GATTS_CONNECT_EVT:
+        ESP_LOGI(GATTS_TAG, "Connected, conn_id %d, remote "ESP_BD_ADDR_STR"",
+                 param->connect.conn_id, ESP_BD_ADDR_HEX(param->connect.remote_bda));
+        gl_profile_tab[PROFILE_B_APP_ID].conn_id = param->connect.conn_id;
+        break;
+    case ESP_GATTS_CONF_EVT:
+        ESP_LOGI(GATTS_TAG, "Confirm receive, status %d, attr_handle %d", param->conf.status, param->conf.handle);
+        if (param->conf.status != ESP_GATT_OK){
+            esp_log_buffer_hex(GATTS_TAG, param->conf.value, param->conf.len);
+        }
+    break;
+    case ESP_GATTS_DISCONNECT_EVT:
+    case ESP_GATTS_OPEN_EVT:
+    case ESP_GATTS_CANCEL_OPEN_EVT:
+    case ESP_GATTS_CLOSE_EVT:
+    case ESP_GATTS_LISTEN_EVT:
+    case ESP_GATTS_CONGEST_EVT:
+    default:
+        break;
+    }
+}
+
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+{
+    /* If event is register event, store the gatts_if for each profile */
+    if (event == ESP_GATTS_REG_EVT) {
+        if (param->reg.status == ESP_GATT_OK) {
+            gl_profile_tab[param->reg.app_id].gatts_if = gatts_if;
+        } else {
+            ESP_LOGI(GATTS_TAG, "Reg app failed, app_id %04x, status %d\n",
+                    param->reg.app_id,
+                    param->reg.status);
+            return;
+        }
+    }
+
+    /* If the gatts_if equal to profile A, call profile A cb handler,
+     * so here call each profile's callback */
+    do {
+        int idx;
+        for (idx = 0; idx < PROFILE_NUM; idx++) {
+            if (gatts_if == ESP_GATT_IF_NONE || /* ESP_GATT_IF_NONE, not specify a certain gatt_if, need to call every profile cb function */
+                    gatts_if == gl_profile_tab[idx].gatts_if) {
+                if (gl_profile_tab[idx].gatts_cb) {
+                    gl_profile_tab[idx].gatts_cb(event, gatts_if, param);
+                }
+            }
+        }
+    } while (0);
+}
+
+void app_main(void)
+{
+    esp_err_t ret;
+
+    // Initialize NVS.
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK( ret );
+
+
+    // WiFi 스캔 먼저 실행
+    ESP_LOGI(GATTS_TAG, "=== 부팅 시 WiFi 스캔 시작 ===");
+    wifi_scan_on_boot();
+    ESP_LOGI(GATTS_TAG, "========================");
+
+    #if CONFIG_EXAMPLE_CI_PIPELINE_ID
+    memcpy(test_device_name, esp_bluedroid_get_example_name(), ESP_BLE_ADV_NAME_LEN_MAX);
+    #endif
+
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s initialize controller failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s enable controller failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
+    ret = esp_bluedroid_init();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s init bluetooth failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
+    ret = esp_bluedroid_enable();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s enable bluetooth failed: %s\n", __func__, esp_err_to_name(ret));
+        return;
+    }
+    // Note: Avoid performing time-consuming operations within callback functions.
+    ret = esp_ble_gatts_register_callback(gatts_event_handler);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gatts register error, error code = %x", ret);
+        return;
+    }
+    ret = esp_ble_gap_register_callback(gap_event_handler);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gap register error, error code = %x", ret);
+        return;
+    }
+    ret = esp_ble_gatts_app_register(PROFILE_A_APP_ID);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gatts app register error, error code = %x", ret);
+        return;
+    }
+    ret = esp_ble_gatts_app_register(PROFILE_B_APP_ID);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gatts app register error, error code = %x", ret);
+        return;
+    }
+    esp_err_t local_mtu_ret = esp_ble_gatt_set_local_mtu(500);
+    if (local_mtu_ret){
+        ESP_LOGE(GATTS_TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
+    }
+
+    // BLE 초기화 완료 후 WiFi 자격 증명 체크
+    ESP_LOGI(GATTS_TAG, "=== 부팅 시 WiFi 체크 ===");
+    if (check_wifi_credentials_exist()) {
+        ESP_LOGI(GATTS_TAG, "저장된 WiFi 발견: %s", wifi_id);
+        ESP_LOGI(GATTS_TAG, "자동 WiFi 연결 시도...");
+        // WiFi 자격 증명이 있으면 자동으로 WiFi 연결 시도
+        current_gatts_if = ESP_GATT_IF_NONE;
+        current_conn_id = 0;
+        wifi_init_sta();
+    } else {
+        ESP_LOGI(GATTS_TAG, "저장된 WiFi 없음, BLE만 시작");
+    }
+    ESP_LOGI(GATTS_TAG, "=======================");
+
+    return;
+}
+
+// WiFi 이벤트 핸들러 추가
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                              int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(GATTS_TAG, "*** WiFi 연결 실패 ***");
+        wifi_event_sta_disconnected_t* disconnected = (wifi_event_sta_disconnected_t*) event_data;
+        ESP_LOGI(GATTS_TAG, "실패 이유: %d", disconnected->reason);
+        
+        // 실패 이유별 메시지
+        switch(disconnected->reason) {
+            case WIFI_REASON_NO_AP_FOUND:
+                ESP_LOGI(GATTS_TAG, "*** AP를 찾을 수 없음 ***");
+                ESP_LOGI(GATTS_TAG, "SSID '%s'가 주변에 없습니다", wifi_id);
+                ESP_LOGI(GATTS_TAG, "가능한 원인:");
+                ESP_LOGI(GATTS_TAG, "1. WiFi 이름이 틀렸을 수 있음");
+                ESP_LOGI(GATTS_TAG, "2. WiFi가 꺼져있을 수 있음");
+                ESP_LOGI(GATTS_TAG, "3. ESP32가 WiFi 범위 밖에 있을 수 있음");
+                break;
+            case WIFI_REASON_AUTH_FAIL:
+                ESP_LOGI(GATTS_TAG, "*** 인증 실패 ***");
+                ESP_LOGI(GATTS_TAG, "비밀번호가 틀렸습니다");
+                break;
+            case WIFI_REASON_ASSOC_FAIL:
+                ESP_LOGI(GATTS_TAG, "*** 연결 실패 ***");
+                ESP_LOGI(GATTS_TAG, "신호가 약하거나 설정 문제");
+                break;
+            default:
+                ESP_LOGI(GATTS_TAG, "*** 기타 실패: %d ***", disconnected->reason);
+                break;
+        }
+        
+        if (s_retry_num < 5) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(GATTS_TAG, "재시도 %d/5", s_retry_num);
+        } else {
+            ESP_LOGI(GATTS_TAG, "*** WiFi 최종 실패 ***");
+            // EventGroup이 유효한지 확인 후 설정
+            if (s_wifi_event_group != NULL) {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            } else {
+                ESP_LOGW(GATTS_TAG, "WiFi EventGroup이 NULL입니다. 생성 중...");
+                s_wifi_event_group = xEventGroupCreate();
+                if (s_wifi_event_group != NULL) {
+                    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+                }
+            }
+            // WiFi 연결 최종 실패 시 앱으로 실패 메시지 전송
+            if (current_gatts_if != ESP_GATT_IF_NONE) {
+                send_wifi_fail(current_gatts_if, current_conn_id);
+            }
+        }
+        wifi_connected = false;
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(GATTS_TAG, "*** WiFi 연결 성공! ***");
+        ESP_LOGI(GATTS_TAG, "IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        // EventGroup이 유효한지 확인 후 설정
+        if (s_wifi_event_group != NULL) {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        } else {
+            ESP_LOGW(GATTS_TAG, "WiFi EventGroup이 NULL입니다. 생성 중...");
+            s_wifi_event_group = xEventGroupCreate();
+            if (s_wifi_event_group != NULL) {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            }
+        }
+        wifi_connected = true;
+        
+        // WiFi 연결 성공 시 앱으로 성공 메시지 전송
+        if (current_gatts_if != ESP_GATT_IF_NONE) {
+            send_wifi_success(current_gatts_if, current_conn_id);
+        }
+        
+        // WiFi 연결 성공 후 HTTP 요청 자동 실행
+        ESP_LOGI(GATTS_TAG, "WiFi 연결 완료, HTTP 요청 시작...");
+        send_http_request();
+    }
+}
+
+// WiFi 초기화 함수 추가 (비블로킹 방식)
+void wifi_init_sta(void)
+{
+    // EventGroup이 이미 생성되었는지 확인
+    if (s_wifi_event_group == NULL) {
+        s_wifi_event_group = xEventGroupCreate();
+        if (s_wifi_event_group == NULL) {
+            ESP_LOGE(GATTS_TAG, "WiFi EventGroup 생성 실패!");
+            return;
+        }
+    }
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_OPEN,  // 비밀번호 없는 WiFi용
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+    
+    // 비밀번호가 있으면 WPA2_PSK로 변경
+    if (strlen(wifi_pw) > 0) {
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        ESP_LOGI(GATTS_TAG, "비밀번호 있음 - WPA2_PSK 모드");
+    } else {
+        ESP_LOGI(GATTS_TAG, "비밀번호 없음 - OPEN 모드");
+    }
+    
+    // WiFi 자격 증명 설정
+    strncpy((char*)wifi_config.sta.ssid, wifi_id, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, wifi_pw, sizeof(wifi_config.sta.password) - 1);
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+
+    ESP_LOGI(GATTS_TAG, "WiFi 초기화 완료, 연결 시도 중...");
+    
+    // 비블로킹 방식으로 WiFi 연결 시작 (BLE와 충돌 방지)
+    esp_wifi_connect();
+}
+
+// WiFi 스캔 이벤트 핸들러
+static void wifi_scan_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+        wifi_event_sta_scan_done_t* scan_done = (wifi_event_sta_scan_done_t*) event_data;
+        ESP_LOGI(GATTS_TAG, "*** WiFi 스캔 완료 ***");
+        ESP_LOGI(GATTS_TAG, "발견된 AP 수: %d", scan_done->number);
+        
+        wifi_scan_done = true;
+        
+        if (scan_done->number == 0) {
+            ESP_LOGI(GATTS_TAG, "주변에 WiFi 네트워크가 없습니다");
+            target_wifi_found = false;
+        } else {
+            // 스캔 결과 확인
+            uint16_t ap_count = scan_done->number;
+            wifi_ap_record_t ap_info[ap_count];
+            uint16_t ap_count_found = 0;
+            
+            esp_wifi_scan_get_ap_records(&ap_count_found, ap_info);
+            
+            ESP_LOGI(GATTS_TAG, "스캔된 AP 목록:");
+            for (int i = 0; i < ap_count_found; i++) {
+                const char* auth_str = "UNKNOWN";
+                switch(ap_info[i].authmode) {
+                    case WIFI_AUTH_OPEN: auth_str = "OPEN"; break;
+                    case WIFI_AUTH_WEP: auth_str = "WEP"; break;
+                    case WIFI_AUTH_WPA_PSK: auth_str = "WPA_PSK"; break;
+                    case WIFI_AUTH_WPA2_PSK: auth_str = "WPA2_PSK"; break;
+                    case WIFI_AUTH_WPA_WPA2_PSK: auth_str = "WPA_WPA2_PSK"; break;
+                    case WIFI_AUTH_WPA2_ENTERPRISE: auth_str = "WPA2_ENTERPRISE"; break;
+                    case WIFI_AUTH_WPA3_PSK: auth_str = "WPA3_PSK"; break;
+                    case WIFI_AUTH_WPA2_WPA3_PSK: auth_str = "WPA2_WPA3_PSK"; break;
+                    case WIFI_AUTH_WAPI_PSK: auth_str = "WAPI_PSK"; break;
+                    case WIFI_AUTH_OWE: auth_str = "OWE"; break;
+                    case WIFI_AUTH_WPA3_ENT_192: auth_str = "WPA3_ENT_192"; break;
+                    case WIFI_AUTH_WPA_ENTERPRISE: auth_str = "WPA_ENTERPRISE"; break;
+                    default: auth_str = "UNKNOWN"; break;
+                }
+                ESP_LOGI(GATTS_TAG, "  %d. SSID: '%s', RSSI: %d, Auth: %s", 
+                         i+1, ap_info[i].ssid, ap_info[i].rssi, auth_str);
+                
+                // 목표 WiFi 찾기 (대소문자 구분 없이)
+                if (strcasecmp((char*)ap_info[i].ssid, wifi_id) == 0) {
+                    ESP_LOGI(GATTS_TAG, "*** 목표 WiFi 발견! ***");
+                    ESP_LOGI(GATTS_TAG, "SSID: %s, RSSI: %d, Auth: %d", 
+                             ap_info[i].ssid, ap_info[i].rssi, ap_info[i].authmode);
+                    
+                    // 인증 모드 확인
+                    if (ap_info[i].authmode == WIFI_AUTH_OPEN) {
+                        ESP_LOGI(GATTS_TAG, "공개 WiFi - 비밀번호 불필요");
+                        if (strlen(wifi_pw) == 0) {
+                            target_wifi_found = true;
+                        } else {
+                            ESP_LOGI(GATTS_TAG, "경고: 공개 WiFi인데 비밀번호가 설정됨");
+                            target_wifi_found = true; // 비밀번호 무시하고 연결 시도
+                        }
+                    } else {
+                        ESP_LOGI(GATTS_TAG, "보안 WiFi - 비밀번호 필요");
+                        if (strlen(wifi_pw) > 0) {
+                            target_wifi_found = true;
+                        } else {
+                            ESP_LOGI(GATTS_TAG, "오류: 보안 WiFi인데 비밀번호가 없음");
+                            target_wifi_found = false;
+                        }
+                    }
+                    break;
+                }
+            }
+            
+            if (!target_wifi_found) {
+                ESP_LOGI(GATTS_TAG, "*** 목표 WiFi '%s'를 찾을 수 없음 ***", wifi_id);
+            }
+        }
+        
+        // 스캔 완료 후 연결 시도
+        if (target_wifi_found) {
+            ESP_LOGI(GATTS_TAG, "*** WiFi 연결 시도 ***");
+            wifi_init_sta();
+        } else {
+            ESP_LOGI(GATTS_TAG, "*** WiFi 연결 불가능 ***");
+            if (current_gatts_if != ESP_GATT_IF_NONE) {
+                send_wifi_fail(current_gatts_if, current_conn_id);
+            }
+        }
+    }
+}
+
+// WiFi 스캔 및 연결 함수
+void wifi_scan_and_connect(esp_gatt_if_t gatts_if, uint16_t conn_id)
+{
+    ESP_LOGI(GATTS_TAG, "*** WiFi 스캔 및 연결 시작 ***");
+    
+    if (strlen(wifi_id) == 0) {
+        ESP_LOGE(GATTS_TAG, "WiFi ID is empty, cannot connect");
+        send_wifi_fail(gatts_if, conn_id);
+        return;
+    }
+    
+    // 현재 연결 정보 저장
+    current_gatts_if = gatts_if;
+    current_conn_id = conn_id;
+    
+    // 받은 WiFi 자격 증명 출력
+    ESP_LOGI(GATTS_TAG, "=== WiFi 연결 시도 ===");
+    ESP_LOGI(GATTS_TAG, "ID: %s", wifi_id);
+    ESP_LOGI(GATTS_TAG, "PW: %s", strlen(wifi_pw) > 0 ? wifi_pw : "(비밀번호 없음)");
+    ESP_LOGI(GATTS_TAG, "===================");
+    
+    // WiFi 초기화 (이미 초기화된 경우 체크)
+    if (s_wifi_event_group == NULL) {
+        s_wifi_event_group = xEventGroupCreate();
+        if (s_wifi_event_group == NULL) {
+            ESP_LOGE(GATTS_TAG, "WiFi EventGroup 생성 실패!");
+            send_wifi_fail(gatts_if, conn_id);
+            return;
+        }
+    }
+    
+    // netif와 event loop은 이미 초기화되어 있을 수 있음
+    // 중복 초기화 방지 - 이미 초기화되었는지 확인
+    static bool netif_initialized = false;
+    static bool event_loop_initialized = false;
+    
+    if (!netif_initialized) {
+        esp_netif_init();
+        netif_initialized = true;
+    }
+    
+    if (!event_loop_initialized) {
+        esp_event_loop_create_default();
+        event_loop_initialized = true;
+    }
+    
+    esp_netif_create_default_wifi_sta();
+
+    // WiFi 초기화 (중복 초기화 방지)
+    static bool wifi_initialized = false;
+    if (!wifi_initialized) {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        wifi_initialized = true;
+    }
+
+    // 스캔 이벤트 핸들러 등록
+    esp_event_handler_instance_t instance_scan_done;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        WIFI_EVENT_SCAN_DONE,
+                                                        &wifi_scan_event_handler,
+                                                        NULL,
+                                                        &instance_scan_done));
+
+    // 연결 이벤트 핸들러 등록
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    // WiFi 초기화 완료 대기
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // 스캔 시작
+    wifi_scan_done = false;
+    target_wifi_found = false;
+    
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,  // 숨겨진 네트워크는 스캔하지 않음
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time = {
+            .active = {
+                .min = 200,  // 스캔 시간 증가
+                .max = 500
+            }
+        }
+    };
+    
+    ESP_LOGI(GATTS_TAG, "*** WiFi 스캔 시작 (2초 대기 후) ***");
+    
+    // 스캔 시작 전에 WiFi 상태 확인
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    ESP_LOGI(GATTS_TAG, "WiFi 모드: %d", mode);
+    
+    esp_err_t ret = esp_wifi_scan_start(&scan_config, false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "WiFi 스캔 시작 실패: %s", esp_err_to_name(ret));
+        ESP_LOGI(GATTS_TAG, "스캔 없이 직접 연결 시도...");
+        // 스캔 실패 시 직접 연결 시도
+        wifi_init_sta();
+    } else {
+        ESP_LOGI(GATTS_TAG, "WiFi 스캔 시작 성공, 결과 대기 중...");
+    }
+}
+
+// 부팅 시 WiFi 스캔 함수
+void wifi_scan_on_boot(void)
+{
+    ESP_LOGI(GATTS_TAG, "*** 부팅 시 WiFi 스캔 시작 ***");
+    
+    // WiFi 초기화 - 중복 초기화 방지
+    static bool boot_netif_initialized = false;
+    static bool boot_event_loop_initialized = false;
+    
+    if (!boot_netif_initialized) {
+        esp_netif_init();
+        boot_netif_initialized = true;
+    }
+    
+    if (!boot_event_loop_initialized) {
+        esp_event_loop_create_default();
+        boot_event_loop_initialized = true;
+    }
+    
+    esp_netif_create_default_wifi_sta();
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    
+    // WiFi 모드 설정
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+    
+    // 스캔 설정
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time = {
+            .active = {
+                .min = 100,
+                .max = 300
+            }
+        }
+    };
+    
+    // 스캔 시작
+    esp_err_t ret = esp_wifi_scan_start(&scan_config, false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "WiFi 스캔 시작 실패: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ESP_LOGI(GATTS_TAG, "WiFi 스캔 시작됨, 결과 대기 중...");
+    
+    // 스캔 결과 대기 (3초)
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // 스캔 결과 가져오기
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    ESP_LOGI(GATTS_TAG, "발견된 AP 개수: %d", ap_count);
+    
+    if (ap_count > 0) {
+        wifi_ap_record_t ap_records[ap_count];
+        esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+        
+        ESP_LOGI(GATTS_TAG, "=== 주변 WiFi 목록 ===");
+        for (int i = 0; i < ap_count; i++) {
+            const char* auth_str = "UNKNOWN";
+            switch(ap_records[i].authmode) {
+                case WIFI_AUTH_OPEN: auth_str = "OPEN"; break;
+                case WIFI_AUTH_WEP: auth_str = "WEP"; break;
+                case WIFI_AUTH_WPA_PSK: auth_str = "WPA_PSK"; break;
+                case WIFI_AUTH_WPA2_PSK: auth_str = "WPA2_PSK"; break;
+                case WIFI_AUTH_WPA_WPA2_PSK: auth_str = "WPA_WPA2_PSK"; break;
+                case WIFI_AUTH_WPA2_ENTERPRISE: auth_str = "WPA2_ENTERPRISE"; break;
+                case WIFI_AUTH_WPA3_PSK: auth_str = "WPA3_PSK"; break;
+                case WIFI_AUTH_WPA2_WPA3_PSK: auth_str = "WPA2_WPA3_PSK"; break;
+                case WIFI_AUTH_WAPI_PSK: auth_str = "WAPI_PSK"; break;
+                case WIFI_AUTH_OWE: auth_str = "OWE"; break;
+                case WIFI_AUTH_WPA3_ENT_192: auth_str = "WPA3_ENT_192"; break;
+                case WIFI_AUTH_WPA_ENTERPRISE: auth_str = "WPA_ENTERPRISE"; break;
+                default: auth_str = "UNKNOWN"; break;
+            }
+            ESP_LOGI(GATTS_TAG, "  %d. SSID: '%s', RSSI: %d, Auth: %s", 
+                     i+1, ap_records[i].ssid, ap_records[i].rssi, auth_str);
+        }
+        ESP_LOGI(GATTS_TAG, "========================");
+    } else {
+        ESP_LOGI(GATTS_TAG, "주변에 WiFi가 없습니다");
+    }
+    
+    // WiFi는 정리하지 않고 유지 (나중에 연결할 때 사용)
+    ESP_LOGI(GATTS_TAG, "*** 부팅 시 WiFi 스캔 완료 (WiFi 유지) ***");
+}
+
+// WiFi 연결 함수 추가 (간단한 버전)
+void connect_to_wifi(esp_gatt_if_t gatts_if, uint16_t conn_id)
+{
+    ESP_LOGI(GATTS_TAG, "*** WiFi 연결 함수 진입 ***");
+    
+    if (strlen(wifi_id) == 0) {
+        ESP_LOGE(GATTS_TAG, "WiFi ID is empty, cannot connect");
+        send_wifi_fail(gatts_if, conn_id);
+        return;
+    }
+    
+    // 현재 연결 정보 저장
+    current_gatts_if = gatts_if;
+    current_conn_id = conn_id;
+    
+    // 받은 WiFi 자격 증명 출력
+    ESP_LOGI(GATTS_TAG, "=== WiFi 연결 시도 ===");
+    ESP_LOGI(GATTS_TAG, "ID: %s", wifi_id);
+    ESP_LOGI(GATTS_TAG, "PW: %s", strlen(wifi_pw) > 0 ? wifi_pw : "(비밀번호 없음)");
+    ESP_LOGI(GATTS_TAG, "PW 길이: %d", strlen(wifi_pw));
+    ESP_LOGI(GATTS_TAG, "PW 첫 글자: %d", wifi_pw[0]);
+    ESP_LOGI(GATTS_TAG, "===================");
+    
+    // WiFi가 이미 초기화되어 있으므로 설정만 변경
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_OPEN,  // 기본값: 비밀번호 없는 WiFi용
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+    
+    // 비밀번호가 있으면 WPA2_PSK로 변경 (공백, \r, \n 제거 후 체크)
+    char trimmed_pw[64];
+    strncpy(trimmed_pw, wifi_pw, sizeof(trimmed_pw) - 1);
+    trimmed_pw[sizeof(trimmed_pw) - 1] = '\0';
+    
+    // 앞뒤 공백, \r, \n 제거
+    char *start = trimmed_pw;
+    char *end = start + strlen(trimmed_pw) - 1;
+    
+    // 앞쪽 공백 제거
+    while (start <= end && (*start == ' ' || *start == '\r' || *start == '\n' || *start == '\t')) {
+        start++;
+    }
+    
+    // 뒤쪽 공백 제거
+    while (end >= start && (*end == ' ' || *end == '\r' || *end == '\n' || *end == '\t')) {
+        *end = '\0';
+        end--;
+    }
+    
+    if (strlen(start) > 0) {
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        ESP_LOGI(GATTS_TAG, "비밀번호 있음 - WPA2_PSK 모드");
+        strncpy((char*)wifi_config.sta.password, start, sizeof(wifi_config.sta.password) - 1);
+    } else {
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        ESP_LOGI(GATTS_TAG, "비밀번호 없음 - OPEN 모드");
+        memset(wifi_config.sta.password, 0, sizeof(wifi_config.sta.password));
+    }
+    
+    // WiFi 자격 증명 설정 (SSID만 설정, 비밀번호는 위에서 이미 설정됨)
+    strncpy((char*)wifi_config.sta.ssid, wifi_id, sizeof(wifi_config.sta.ssid) - 1);
+    
+    // WiFi 설정 적용
+    esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "WiFi 설정 실패: %s", esp_err_to_name(ret));
+        send_wifi_fail(gatts_if, conn_id);
+        return;
+    }
+    
+    // WiFi 이벤트 핸들러 등록 (아직 등록되지 않은 경우)
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+    
+    // 기존 연결이 있으면 먼저 끊기 (BLE 연결 유지를 위해 짧게)
+    ESP_LOGI(GATTS_TAG, "*** 기존 WiFi 연결 끊기 ***");
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(500)); // 0.5초로 단축
+    
+    // WiFi 연결 시도
+    ESP_LOGI(GATTS_TAG, "*** WiFi 연결 시도 ***");
+    ret = esp_wifi_connect();
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "WiFi 연결 시작 실패: %s", esp_err_to_name(ret));
+        send_wifi_fail(gatts_if, conn_id);
+        return;
+    }
+    
+    // 연결 성공을 기다림 (3초로 단축 - BLE 연결 유지)
+    ESP_LOGI(GATTS_TAG, "*** WiFi 연결 대기 중... ***");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // 연결 상태 확인
+    wifi_ap_record_t ap_info;
+    ret = esp_wifi_sta_get_ap_info(&ap_info);
+    if (ret == ESP_OK) {
+        ESP_LOGI(GATTS_TAG, "*** WiFi 연결 성공! ***");
+        ESP_LOGI(GATTS_TAG, "SSID: %s", ap_info.ssid);
+        ESP_LOGI(GATTS_TAG, "RSSI: %d", ap_info.rssi);
+        send_wifi_success(gatts_if, conn_id);
+        
+        // WiFi 연결 성공 후 HTTP 요청 자동 실행
+        ESP_LOGI(GATTS_TAG, "WiFi 연결 완료, HTTP 요청 시작...");
+        send_http_request();
+    } else {
+        ESP_LOGE(GATTS_TAG, "WiFi 연결 실패");
+        send_wifi_fail(gatts_if, conn_id);
+    }
+}
+
+// WiFi 연결 성공 메시지 전송
+void send_wifi_success(esp_gatt_if_t gatts_if, uint16_t conn_id) {
+    const char* success_message = "wifi connected success\n";
+    ESP_LOGI(GATTS_TAG, "앱으로 성공 메시지 전송: %s", success_message);
+    
+    esp_err_t ret = esp_ble_gatts_send_indicate(gatts_if, conn_id, 
+                                                gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                strlen(success_message), 
+                                                (uint8_t*)success_message, 
+                                                false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "메시지 전송 실패: %s", esp_err_to_name(ret));
+    }
+}
+
+// WiFi 연결 실패 메시지 전송
+void send_wifi_fail(esp_gatt_if_t gatts_if, uint16_t conn_id) {
+    const char* fail_message = "wifi connect fail\n";
+    ESP_LOGI(GATTS_TAG, "앱으로 실패 메시지 전송: %s", fail_message);
+    
+    esp_err_t ret = esp_ble_gatts_send_indicate(gatts_if, conn_id, 
+                                                gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                strlen(fail_message), 
+                                                (uint8_t*)fail_message, 
+                                                false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "메시지 전송 실패: %s", esp_err_to_name(ret));
+    }
+}
+
+// WiFi 자격 증명 존재 여부 확인
+bool check_wifi_credentials_exist(void) {
+    return (strlen(wifi_id) > 0);
+}
+
+// Parse WiFi command from BLE data
+bool parse_wifi_command(const char* data, int len) {
+    // Convert to null-terminated string
+    char command[256] = {0};
+    int copy_len = (len < 255) ? len : 255;
+    memcpy(command, data, copy_len);
+    command[copy_len] = '\0';
+    
+    ESP_LOGI(GATTS_TAG, "Received command: %s", command);
+    
+    // Remove leading/trailing whitespace
+    char* trimmed = command;
+    while (*trimmed == ' ' || *trimmed == '\t' || *trimmed == '\r' || *trimmed == '\n') {
+        trimmed++;
+    }
+    
+    ESP_LOGI(GATTS_TAG, "Trimmed command: '%s'", trimmed);
+    ESP_LOGI(GATTS_TAG, "First 5 chars: '%.5s'", trimmed);
+    
+    // Check for "wifi:data1,data2,data3" format
+    if (strncmp(trimmed, "wifi:", 5) == 0) {
+        ESP_LOGI(GATTS_TAG, "Matched wifi: format");
+        char* wifi_data = trimmed + 5; // Skip "wifi:" part
+        
+        // Find first comma (between data1 and data2)
+        char* comma1 = strchr(wifi_data, ',');
+        if (comma1 != NULL) {
+            // Find second comma (between data2 and data3)
+            char* comma2 = strchr(comma1 + 1, ',');
+            if (comma2 != NULL) {
+                // Extract data1 (WiFi ID)
+                int id_len = comma1 - wifi_data;
+                if (id_len < 64 && id_len > 0) {
+                    memset(wifi_id, 0, sizeof(wifi_id));
+                    memcpy(wifi_id, wifi_data, id_len);
+                    wifi_id[id_len] = '\0';
+                    
+                    // Extract data2 (WiFi Password)
+                    int pw_len = comma2 - (comma1 + 1);
+                    if (pw_len < 64) {
+                        memset(wifi_pw, 0, sizeof(wifi_pw));
+                        if (pw_len > 0) {
+                            memcpy(wifi_pw, comma1 + 1, pw_len);
+                            wifi_pw[pw_len] = '\0';
+                        }
+                        // pw_len이 0이면 빈 문자열로 유지 (null 값)
+                        
+                        // Extract data3 (User Email)
+                        char* email_start = comma2 + 1;
+                        int email_len = strlen(email_start);
+                        if (email_len < 128) {  // 빈 값도 허용
+                            memset(user_email, 0, sizeof(user_email));
+                            if (email_len > 0) {
+                                memcpy(user_email, email_start, email_len);
+                                user_email[email_len] = '\0';
+                            }
+                            // email_len이 0이면 빈 문자열로 유지 (null 값)
+                            
+                            ESP_LOGI(GATTS_TAG, "WiFi credentials and email updated:");
+                            ESP_LOGI(GATTS_TAG, "  WiFi ID: %s", wifi_id);
+                            ESP_LOGI(GATTS_TAG, "  WiFi PW: %s", strlen(wifi_pw) > 0 ? wifi_pw : "(empty)");
+                            ESP_LOGI(GATTS_TAG, "  User Email: %s", strlen(user_email) > 0 ? user_email : "(empty)");
+                            
+                            return true; // Success
+                        } else {
+                            ESP_LOGE(GATTS_TAG, "User email too long (max 127 chars)");
+                        }
+                    } else {
+                        ESP_LOGE(GATTS_TAG, "WiFi password too long (max 63 chars)");
+                    }
+                } else {
+                    ESP_LOGE(GATTS_TAG, "WiFi ID too long or empty (max 63 chars)");
+                }
+            } else {
+                ESP_LOGE(GATTS_TAG, "Second comma not found in WiFi command (expected format: wifi:id,pw,email)");
+            }
+        } else {
+            ESP_LOGE(GATTS_TAG, "First comma not found in WiFi command (expected format: wifi:id,pw,email)");
+        }
+    }
+    // Check for "id:aaa,pw:bbb" format
+    else {
+        char* id_start = strstr(command, "id:");
+        char* pw_start = strstr(command, "pw:");
+        
+        if (id_start != NULL && pw_start != NULL) {
+            // Extract WiFi ID
+            id_start += 3; // Skip "id:"
+            char* comma_pos = strchr(id_start, ',');
+            if (comma_pos != NULL) {
+                int id_len = comma_pos - id_start;
+                if (id_len < 64 && id_len > 0) {
+                    memset(wifi_id, 0, sizeof(wifi_id));
+                    memcpy(wifi_id, id_start, id_len);
+                    wifi_id[id_len] = '\0';
+                    
+                    // Extract WiFi password
+                    pw_start += 3; // Skip "pw:"
+                    int pw_len = strlen(pw_start);
+                    if (pw_len < 64 && pw_len > 0) {
+                        memset(wifi_pw, 0, sizeof(wifi_pw));
+                        memcpy(wifi_pw, pw_start, pw_len);
+                        wifi_pw[pw_len] = '\0';
+                        
+                        ESP_LOGI(GATTS_TAG, "WiFi credentials updated:");
+                        ESP_LOGI(GATTS_TAG, "  ID: %s", wifi_id);
+                        ESP_LOGI(GATTS_TAG, "  PW: %s", wifi_pw);
+                        return true; // Success
+                    } else {
+                        ESP_LOGE(GATTS_TAG, "WiFi password too long or empty (max 63 chars)");
+                    }
+                } else {
+                    ESP_LOGE(GATTS_TAG, "WiFi ID too long or empty (max 63 chars)");
+                }
+            } else {
+                ESP_LOGE(GATTS_TAG, "Invalid format: missing comma after ID");
+            }
+        } else {
+            ESP_LOGI(GATTS_TAG, "Unknown command format. Expected: wifi:id,password or id:aaa,pw:bbb");
+        }
+    }
+    
+    return false; // Failed
+}
+
+// Send "ok" response to smartphone
+void send_ok_response(esp_gatt_if_t gatts_if, uint16_t conn_id) {
+    const char* ok_message = "ok\n";  // Add newline
+    ESP_LOGI(GATTS_TAG, "Attempting to send OK response: '%s'", ok_message);
+    
+    // Update characteristic value directly
+    /* esp_gatt_char_value_t char_value = {
+        .handle = gl_profile_tab[PROFILE_B_APP_ID].char_handle,
+        .len = strlen(ok_message),
+        .offset = 0,
+        .auth_req = ESP_GATT_AUTH_REQ_NONE
+    };
+    memcpy(char_value.value, ok_message, strlen(ok_message));
+    
+    esp_err_t ret = esp_ble_gatts_set_attr_value(gl_profile_tab[PROFILE_A_APP_ID].char_handle, 
+                                                 char_value.len, 
+                                                 char_value.value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "Failed to send OK response: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(GATTS_TAG, "Sent OK response to smartphone");
+    } */
+    
+    // Store response in global variable for reading
+    strncpy(response_message, ok_message, sizeof(response_message) - 1);
+    response_message[sizeof(response_message) - 1] = '\0';
+    
+    ESP_LOGI(GATTS_TAG, "Response stored: '%s'", response_message);
+    
+    // Send "ok" via BLE notify like the test data
+    esp_err_t ret = esp_ble_gatts_send_indicate(gatts_if, conn_id, 
+                                                gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                strlen(ok_message), 
+                                                (uint8_t*)ok_message, 
+                                                false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "Failed to send OK via notify: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(GATTS_TAG, "OK sent via notify successfully");
+    }
+}
+
+// Send WiFi information to smartphone
+void send_wifi_info(esp_gatt_if_t gatts_if, uint16_t conn_id) {
+    char wifi_info[256]; // Increased buffer size
+    int len = snprintf(wifi_info, sizeof(wifi_info), "id:%s,pw:%s", wifi_id, wifi_pw);  // No newline here
+    
+    if (len >= sizeof(wifi_info)) {
+        ESP_LOGE(GATTS_TAG, "WiFi info too long, truncated");
+        len = sizeof(wifi_info) - 1;
+        wifi_info[len] = '\0';
+    }
+    
+    // Add newline at the end
+    if (len < sizeof(wifi_info) - 1) {
+        wifi_info[len] = '\n';
+        wifi_info[len + 1] = '\0';
+        len++;
+    }
+    
+    esp_err_t ret = esp_ble_gatts_send_indicate(gatts_if, conn_id, 
+                                                gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                len, 
+                                                (uint8_t*)wifi_info, 
+                                                false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "Failed to send WiFi info: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(GATTS_TAG, "Sent WiFi info to smartphone: %s", wifi_info);
+    }
+}
+
+// HTTP 이벤트 핸들러
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    switch(evt->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGE(GATTS_TAG, "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGI(GATTS_TAG, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGI(GATTS_TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGI(GATTS_TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGI(GATTS_TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            if (!esp_http_client_is_chunked_response(evt->client)) {
+                // 응답 데이터 저장
+                int len = evt->data_len;
+                if (len > 0 && len < sizeof(http_response) - 1) {
+                    strncpy(http_response, (char*)evt->data, len);
+                    http_response[len] = '\0';
+                    ESP_LOGI(GATTS_TAG, "HTTP Response: %s", http_response);
+                }
+            }
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGI(GATTS_TAG, "HTTP_EVENT_ON_FINISH");
+            http_request_completed = true;
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI(GATTS_TAG, "HTTP_EVENT_DISCONNECTED");
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
+// HTTP 요청 전송 함수
+void send_http_request(void)
+{
+    ESP_LOGI(GATTS_TAG, "*** HTTP 요청 시작: localhost:3060/hub/check ***");
+    
+    // HTTP 클라이언트 설정
+    esp_http_client_config_t config = {
+        .url = "http://192.168.0.1:3060/hub/check",  // localhost 대신 실제 IP 사용
+        .method = HTTP_METHOD_GET,
+        .event_handler = http_event_handler,
+        .timeout_ms = 10000,  // 10초 타임아웃
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(GATTS_TAG, "HTTP 클라이언트 초기화 실패");
+        return;
+    }
+    
+    // HTTP 요청 실행
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        int content_length = esp_http_client_get_content_length(client);
+        ESP_LOGI(GATTS_TAG, "HTTP Status = %d, content_length = %d", status_code, content_length);
+        
+        if (status_code == 200) {
+            ESP_LOGI(GATTS_TAG, "HTTP 요청 성공!");
+            // BLE로 응답 전송
+            if (current_gatts_if != ESP_GATT_IF_NONE) {
+                send_http_response(current_gatts_if, current_conn_id, http_response);
+            }
+        } else {
+            ESP_LOGE(GATTS_TAG, "HTTP 요청 실패: %d", status_code);
+            if (current_gatts_if != ESP_GATT_IF_NONE) {
+                send_http_response(current_gatts_if, current_conn_id, "HTTP request failed");
+            }
+        }
+    } else {
+        ESP_LOGE(GATTS_TAG, "HTTP 요청 수행 실패: %s", esp_err_to_name(err));
+        if (current_gatts_if != ESP_GATT_IF_NONE) {
+            send_http_response(current_gatts_if, current_conn_id, "HTTP request error");
+        }
+    }
+    
+    esp_http_client_cleanup(client);
+}
+
+
+// HTTP 응답을 BLE로 전송
+void send_http_response(esp_gatt_if_t gatts_if, uint16_t conn_id, const char* response)
+{
+    char message[256];
+    snprintf(message, sizeof(message), "HTTP Response: %s\n", response);
+    
+    ESP_LOGI(GATTS_TAG, "BLE로 HTTP 응답 전송: %s", message);
+    
+    esp_err_t ret = esp_ble_gatts_send_indicate(gatts_if, conn_id, 
+                                                gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                strlen(message), 
+                                                (uint8_t*)message, 
+                                                false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "HTTP 응답 전송 실패: %s", esp_err_to_name(ret));
+    }
+}
+

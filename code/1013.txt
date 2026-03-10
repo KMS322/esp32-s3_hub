@@ -1,0 +1,354 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_mac.h"
+
+// BLE 관련 헤더
+#include "ble_gatt.h"
+
+// NVS 매니저
+#include "nvs_manager.h"
+
+// WiFi 매니저
+#include "wifi_manager.h"
+
+// HTTP 클라이언트
+#include "http_client.h"
+
+// BLE 클라이언트
+#include "ble_client.h"
+
+// WebSocket
+#include "web_socket.h"
+
+#define GATTS_TAG "GATTS_DEMO"
+
+// BLE 연결 상태 확인용 (이제 ble_gatt.h에서 선언됨)
+extern struct gatts_profile_inst gl_profile_tab[];
+extern uint16_t descr_value;
+
+// BLE로 받은 WiFi 데이터
+extern char ble_wifi_id[64];
+extern char ble_wifi_pw[64]; 
+extern char ble_user_email[128];
+
+// 로컬 WiFi 데이터 (NVS에서 로드한 데이터)
+char* local_wifi_id = NULL;
+char* local_wifi_pw = NULL;
+char* local_user_email = NULL;
+char* local_mac_address = NULL;
+
+// NVS에서 로드한 WiFi 데이터 (전역 변수)
+char* wifi_id_from_nvs = NULL;
+char* wifi_pw_from_nvs = NULL;
+char* user_email_from_nvs = NULL;
+char* mac_address_from_nvs = NULL;
+
+// MAC address 초기화 함수
+extern void init_mac_address(void);
+extern const char* get_mac_address(void);
+
+// BLE 데이터 수신 플래그 관리 함수 (ble_gatt.c에서 정의)
+extern void set_new_ble_data_received(bool received);
+extern bool get_new_ble_data_received(void);
+
+// WiFi 재시도 관련 변수
+static bool wifi_fail_sent = false;
+static char last_ble_wifi_id[64] = {0}; // 마지막으로 시도한 WiFi ID 저장
+static char last_ble_wifi_pw[64] = {0}; // 마지막으로 시도한 WiFi PW 저장
+int retry_count = 0;
+const int MAX_RETRIES = 2;
+
+typedef enum {
+    STATE_HUB_INIT,
+    STATE_NVS_WIFI_EXIST,
+    STATE_NVS_WIFI_NOT_EXIST,
+    STATE_BLE_WAIT_ACCOUNT,
+    STATE_WIFI_CONNECT_TRY,
+    STATE_MAC_ADDRESS_CHECK,
+    STATE_SCAN_DEVICES,
+    STATE_WEBSOCKET_INIT,
+} hub_state_t;
+static hub_state_t current_state = STATE_HUB_INIT;
+
+bool send_another_wifi_data = false;
+
+void clean_string(char* str) {
+    char* src = str;
+    char* dst = str;
+    
+    while (*src) {
+        // 개행문자, 캐리지리턴, 탭 등 제거
+        if (*src != '\n' && *src != '\r' && *src != '\t') {
+            *dst++ = *src;
+        }
+        src++;
+    }
+    *dst = '\0';
+}
+
+uint8_t target_macs[][6] = {
+    {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC},  // 첫 번째 MAC
+    {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56}   // 두 번째 MAC
+};
+
+void app_main(void)
+{
+    ESP_LOGI(GATTS_TAG, "=== 허브 시작 ===");
+    // ESP_ERROR_CHECK(nvs_flash_init());
+    // save_nvs(NVS_USER_EMAIL, "a@a.com");
+    // delete_nvs(NVS_WIFI_ID);
+    // delete_nvs(NVS_WIFI_PW);
+    // delete_nvs(NVS_USER_EMAIL);
+    // delete_nvs(NVS_MAC_ADDRESS);
+
+    while(1) {
+        switch(current_state) {
+            case STATE_HUB_INIT:
+                ESP_LOGI(GATTS_TAG, "###### STATE_HUB_INIT 진입 ######");
+                ESP_ERROR_CHECK(nvs_flash_init());
+                ESP_LOGI(GATTS_TAG, "NVS 초기화 완료");
+                wifi_id_from_nvs = load_nvs(NVS_WIFI_ID);
+    
+                if(wifi_id_from_nvs && strlen(wifi_id_from_nvs) > 0) {
+                    wifi_pw_from_nvs = load_nvs(NVS_WIFI_PW);
+                    // current_state = STATE_NVS_WIFI_EXIST;
+                } else {
+                    // current_state = STATE_NVS_WIFI_NOT_EXIST;
+                }
+                current_state = STATE_WEBSOCKET_INIT;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+
+            // nvs에 wifi id가 존재하는 경우
+            case STATE_NVS_WIFI_EXIST:
+                ESP_LOGI(GATTS_TAG, "###### STATE_NVS_WIFI_EXIST 진입 ######");
+                ESP_LOGI(GATTS_TAG, "nvs wifi id : %s", wifi_id_from_nvs);
+                // wifi_pw_from_nvs = load_nvs(NVS_WIFI_PW);
+                if(!is_wifi_initialized()) {
+                    ESP_ERROR_CHECK(wifi_init());
+                }
+                if(!wifi_connected) {
+                    wifi_connected = connect_to_wifi(wifi_id_from_nvs, wifi_pw_from_nvs);
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                current_state = STATE_MAC_ADDRESS_CHECK;
+                break;
+
+            // nvs에 wifi id가 존재하지 않는 경우
+            case STATE_NVS_WIFI_NOT_EXIST: 
+                ESP_LOGI(GATTS_TAG, "###### STATE_NVS_WIFI_NOT_EXIST 진입 ######");
+                if (!is_ble_initialized()) {
+                    ESP_ERROR_CHECK(ble_init());
+                    // ESP_ERROR_CHECK(ble_start_advertising());
+                    ESP_LOGI(GATTS_TAG, "BLE 서버 초기화 및 광고 시작 완료");
+                }
+                current_state = STATE_BLE_WAIT_ACCOUNT;
+                ESP_LOGI(GATTS_TAG, "###### STATE_BLE_WAIT_ACCOUNT로 case 전환 ######");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+
+            // ble로 데이터 받는 것을 대기중인 경우
+            case STATE_BLE_WAIT_ACCOUNT:
+                // ESP_LOGI(GATTS_TAG, "STATE_BLE_WAIT_ACCOUNT 진입");
+                if (strlen(ble_wifi_id) > 0) {
+                    // 새로운 BLE 데이터가 수신되었는지 확인
+                    if (get_new_ble_data_received()) {
+                        bool is_new_wifi_data = (strlen(last_ble_wifi_id) == 0) ||  // 처음이거나
+                                               (strcmp(ble_wifi_id, last_ble_wifi_id) != 0) || 
+                                               (strcmp(ble_wifi_pw, last_ble_wifi_pw) != 0);
+                        if(is_new_wifi_data) {
+                            // 새로운 데이터 저장
+                            strncpy(last_ble_wifi_id, ble_wifi_id, sizeof(last_ble_wifi_id) - 1);
+                            last_ble_wifi_id[sizeof(last_ble_wifi_id) - 1] = '\0';
+                            strncpy(last_ble_wifi_pw, ble_wifi_pw, sizeof(last_ble_wifi_pw) - 1);
+                            last_ble_wifi_pw[sizeof(last_ble_wifi_pw) - 1] = '\0';
+                            
+                            retry_count = 0;
+                            send_another_wifi_data = false;
+                            set_new_ble_data_received(false); // 플래그 리셋
+                            current_state = STATE_WIFI_CONNECT_TRY;
+                        } else {
+                            // 같은 데이터가 다시 수신된 경우
+                            if(!send_another_wifi_data) {
+                                send_ble_message("send another wifi data\n");
+                                send_another_wifi_data = true;
+                            }
+                            set_new_ble_data_received(false); // 플래그 리셋
+                        }
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+
+            // ble로 받은 wifi 계정으로 wifi 연결을 시도하는 경우
+            // 성공하면 nvs에 저장하고 실패하면 다시 ble 대기 모드로 돌아감
+            case STATE_WIFI_CONNECT_TRY:
+                ESP_LOGI(GATTS_TAG, "###### STATE_WIFI_CONNECT_TRY 진입 ######");
+                ESP_LOGI(GATTS_TAG, "retry_count: %d", retry_count);
+                ESP_LOGI(GATTS_TAG, "MAX_RETRIES: %d", MAX_RETRIES);
+                if(retry_count >= MAX_RETRIES) {
+                    send_ble_message("wifi connect fail\n");
+                    current_state = STATE_BLE_WAIT_ACCOUNT;
+                    ESP_LOGI(GATTS_TAG, "###### STATE_BLE_WAIT_ACCOUNT로 case 전환 ######");
+                } else {
+                    if(!is_wifi_initialized()) {
+                        ESP_ERROR_CHECK(wifi_init());
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    wifi_connected = connect_to_wifi(ble_wifi_id, ble_wifi_pw);
+                    if(wifi_connected) {
+                        send_ble_message("wifi connected success\n");
+                        ble_disconnect();
+                        save_nvs(NVS_WIFI_ID, ble_wifi_id);
+                        save_nvs(NVS_WIFI_PW, ble_wifi_pw);
+                        save_nvs(NVS_USER_EMAIL, ble_user_email);
+    
+                        init_mac_address();
+                        const char* local_mac_address = get_mac_address();
+                        save_nvs(NVS_MAC_ADDRESS, local_mac_address);
+    
+                        current_state = STATE_HUB_INIT;
+                    } else {
+                        retry_count++;
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+
+            // express 서버에 hub가 등록되었는지 요청하는 경우
+            case STATE_MAC_ADDRESS_CHECK:   
+                ESP_LOGI(GATTS_TAG, "###### STATE_MAC_ADDRESS_CHECK 진입 ######");
+                // NVS 값이 비어있거나 아직 로드되지 않았다면 로드 (NULL 안전)
+                if (user_email_from_nvs == NULL || strlen(user_email_from_nvs) == 0) {
+                    user_email_from_nvs = load_nvs(NVS_USER_EMAIL);
+                }
+                if (mac_address_from_nvs == NULL || strlen(mac_address_from_nvs) == 0) {
+                    mac_address_from_nvs = load_nvs(NVS_MAC_ADDRESS);
+                }
+
+                if(wifi_connected) {
+                    char json_data[256];
+                    char clean_email[128];
+                    char clean_mac[32];
+                    
+                    // 안전한 복사
+                    strncpy(clean_email, (user_email_from_nvs != NULL) ? user_email_from_nvs : "", sizeof(clean_email) - 1);
+                    strncpy(clean_mac, (mac_address_from_nvs != NULL) ? mac_address_from_nvs : "", sizeof(clean_mac) - 1);
+                    clean_email[sizeof(clean_email) - 1] = '\0';
+                    clean_mac[sizeof(clean_mac) - 1] = '\0';
+                    
+                    // 개행문자 제거
+                    clean_string(clean_email);
+                    clean_string(clean_mac);
+                    
+                    snprintf(json_data, sizeof(json_data),
+                             "{\"user_email\":\"%s\",\"mac_address\":\"%s\"}",
+                             clean_email, clean_mac);
+                    
+                    ESP_LOGI(GATTS_TAG, "최종 JSON: %s", json_data);
+                    send_http_post("/checkMacAddress", json_data);
+                } else {
+                    wifi_connected = connect_to_wifi(wifi_id_from_nvs, wifi_pw_from_nvs);
+                }
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                break;
+            case STATE_SCAN_DEVICES :
+                ESP_LOGI(GATTS_TAG, "###### STATE_SCAN_DEVICES 진입 ######");
+        
+                if (!ble_client_is_initialized()) {
+                    esp_err_t ret = ble_client_init();
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(GATTS_TAG, "BLE 클라이언트 초기화 성공");
+                    } else {
+                        ESP_LOGE(GATTS_TAG, "BLE 클라이언트 초기화 실패: %s", esp_err_to_name(ret));
+                    }
+                }
+                
+                // BLE 클라이언트가 초기화되었을 때만 스캔 시작
+                if (ble_client_is_initialized()) {
+                    ble_client_scan_devices("Tailing", NULL, 0);
+                } else {
+                    ESP_LOGE(GATTS_TAG, "BLE 클라이언트가 초기화되지 않아 스캔을 시작할 수 없습니다");
+                }
+                
+                vTaskDelay(pdMS_TO_TICKS(50000));
+                break;
+            case STATE_WEBSOCKET_INIT :
+                // ESP_LOGI(GATTS_TAG, "###### STATE_WEBSOCKET_INIT 진입 ######");
+                if(!is_wifi_initialized()) {
+                    ESP_ERROR_CHECK(wifi_init());
+                }
+                if(!wifi_connected) {
+                    wifi_connected = connect_to_wifi(wifi_id_from_nvs, wifi_pw_from_nvs);
+                }
+                
+                if(!websocket_server_is_initialized()) {
+                    esp_err_t ret = websocket_server_init();
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(GATTS_TAG, "WebSocket 초기화 성공");
+                    } else {
+                        ESP_LOGE(GATTS_TAG, "WebSocket 초기화 실패: %s", esp_err_to_name(ret));
+                    }
+                }
+
+                if(!websocket_server_is_running()) {
+                    esp_err_t ret = websocket_server_start();
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(GATTS_TAG, "WebSocket 서버 시작");
+                    } else {
+                        ESP_LOGE(GATTS_TAG, "WebSocket 서버 시작 실패: %s", esp_err_to_name(ret));
+                    }
+                }
+
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // MAC address 초기화
+    // init_mac_address();
+    // const char* local_mac_address = get_mac_address();
+    // ESP_LOGI(GATTS_TAG, "Local MAC Address: %s", local_mac_address);
+
+    
+
+    // ESP_LOGI(GATTS_TAG, "BLE 서버 초기화 완료. 앱에서 연결을 기다리는 중...");
+
+    // while (1) {
+    //     // 더 엄격한 BLE 연결 상태 확인
+    //     if (ble_connected && 
+    //         gl_profile_tab[PROFILE_A_APP_ID].descr_handle && 
+    //         descr_value == 0x0001 &&
+    //         gl_profile_tab[PROFILE_A_APP_ID].gatts_if != ESP_GATT_IF_NONE) {
+            
+    //         if (wifi_id_from_nvs && strlen(wifi_id_from_nvs) > 0) {
+    //             send_ble_message("hello from ESP32 111");
+    //             ESP_LOGI(GATTS_TAG, "WiFi ID from NVS: %s", wifi_id_from_nvs);
+    //         } else {
+    //             send_ble_message("hello from ESP32 222");
+    //             ESP_LOGI(GATTS_TAG, "WiFi ID from NVS is empty");
+    //         }
+    //     } else {
+    //         ESP_LOGI(GATTS_TAG, "BLE 연결 또는 Notify 활성화 대기 중...");
+    //         ESP_LOGI(GATTS_TAG, "상태 - connected:%d, descr_handle:%d, descr_value:0x%04x, conn_id:%d, gatts_if:%d", 
+    //                  ble_connected, gl_profile_tab[PROFILE_A_APP_ID].descr_handle, descr_value,
+    //                  gl_profile_tab[PROFILE_A_APP_ID].conn_id, gl_profile_tab[PROFILE_A_APP_ID].gatts_if);
+    //     }
+
+    //     vTaskDelay(pdMS_TO_TICKS(1000));  // 1초 대기
+    // }
+
+    // 실제로 while(1) 때문에 여기까지 도달하지 않음
+    // if (wifi_id_from_nvs) {
+    //     free(wifi_id_from_nvs);
+    // }
+}

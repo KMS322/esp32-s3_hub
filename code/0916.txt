@@ -1,0 +1,238 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_mac.h"
+
+// BLE 관련 헤더
+#include "ble_gatt.h"
+
+// NVS 매니저
+#include "nvs_manager.h"
+
+// WiFi 매니저
+#include "wifi_manager.h"
+
+// HTTP 클라이언트
+#include "http_client.h"
+
+#define GATTS_TAG "GATTS_DEMO"
+
+// BLE 연결 상태 확인용 (이제 ble_gatt.h에서 선언됨)
+extern struct gatts_profile_inst gl_profile_tab[];
+extern uint16_t descr_value;
+
+// BLE로 받은 WiFi 데이터
+extern char ble_wifi_id[64];
+extern char ble_wifi_pw[64];
+extern char ble_user_email[128];
+
+// 로컬 WiFi 데이터 (NVS에서 로드한 데이터)
+char* local_wifi_id = NULL;
+char* local_wifi_pw = NULL;
+char* local_user_email = NULL;
+char* local_mac_address = NULL;
+
+// NVS에서 로드한 WiFi 데이터 (전역 변수)
+char* wifi_id_from_nvs = NULL;
+char* wifi_pw_from_nvs = NULL;
+char* user_email_from_nvs = NULL;
+char* mac_address_from_nvs = NULL;
+
+// MAC address 초기화 함수
+extern void init_mac_address(void);
+extern const char* get_mac_address(void);
+
+// WiFi 재시도 관련 변수
+static bool wifi_fail_sent = false;
+static char last_ble_wifi_id[64] = {0}; // 마지막으로 시도한 WiFi ID 저장
+static char last_ble_wifi_pw[64] = {0}; // 마지막으로 시도한 WiFi PW 저장
+int retry_count = 0;
+const int MAX_RETRIES = 2;
+
+typedef enum {
+    STATE_HUB_INIT,
+    STATE_NVS_WIFI_EXIST,
+    STATE_NVS_WIFI_NOT_EXIST,
+} hub_state_t;
+static wifi_state_t current_state = STATE_HUB_INIT;
+void app_main(void)
+{
+    ESP_LOGI(GATTS_TAG, "=== 허브 시작 ===");
+
+    // NVS 초기화
+
+    switch(current_state) {
+        case STATE_HUB_INIT:
+            ESP_ERROR_CHECK(nvs_flash_init());
+            ESP_LOGI(GATTS_TAG, "NVS 초기화 완료");
+            wifi_id_from_nvs = load_nvs(NVS_WIFI_ID);
+
+            if(wifi_id_from_nvs && strlen(wifi_id_from_nvs) > 0) {
+                wifi_pw_from_nvs = load_nvs(NVS_WIFI_PW);
+                current_state = STATE_NVS_WIFI_EXIST;
+            } else {
+                current_state = STATE_NVS_WIFI_NOT_EXIST;
+            }
+            break;
+        case STATE_NVS_WIFI_EXIST:
+            ESP_LOGI(GATTS_TAG, "nvs wifi id : %s", wifi_id_from_nvs);
+            break;
+        case STATE_NVS_WIFI_NOT_EXIST: 
+            
+            break;
+    }
+
+
+    // WiFi 초기화
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // WiFi 이벤트 핸들러 등록
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    
+    wifi_init_sta();
+    ESP_LOGI(GATTS_TAG, "WiFi 초기화 완료");
+
+    wifi_id_from_nvs = load_nvs(NVS_WIFI_ID);
+    wifi_pw_from_nvs = load_nvs(NVS_WIFI_PW);
+    user_email_from_nvs = load_nvs(NVS_USER_EMAIL);
+    mac_address_from_nvs = load_nvs(NVS_MAC_ADDRESS);
+    ESP_LOGI(GATTS_TAG, "wifi_id_from_nvs: %s", wifi_id_from_nvs);
+    ESP_LOGI(GATTS_TAG, "wifi_pw_from_nvs: %s", wifi_pw_from_nvs);
+    ESP_LOGI(GATTS_TAG, "user_email_from_nvs: %s", user_email_from_nvs);
+    ESP_LOGI(GATTS_TAG, "mac_address_from_nvs: %s", mac_address_from_nvs);
+
+    while(1) { // 무한 루프로 변경하여 계속 재시도 가능하게 함
+        if(strlen(wifi_id_from_nvs) > 0) {
+            // ESP_LOGI(GATTS_TAG, "nvs wifi id : %s", wifi_id_from_nvs);
+            ESP_LOGI(GATTS_TAG, "nvs wifi id : %s", wifi_id_from_nvs);
+        } else {
+            // BLE 서버 초기화
+            if(!ble_connected) {
+                ESP_ERROR_CHECK(ble_init());
+                ESP_ERROR_CHECK(ble_start_advertising());
+                ESP_LOGI(GATTS_TAG, "BLE 서버 초기화 및 광고 시작 완료");
+            }
+    
+            // BLE로 WiFi 데이터를 받을 때까지 대기
+            ESP_LOGI(GATTS_TAG, "BLE로 WiFi 데이터 수신 대기 중...");
+            if (strlen(ble_wifi_id) > 0) {
+                // 새로운 WiFi 데이터인지 확인
+                bool is_new_wifi_data = (strcmp(ble_wifi_id, last_ble_wifi_id) != 0) || 
+                                       (strcmp(ble_wifi_pw, last_ble_wifi_pw) != 0);
+                
+                if (is_new_wifi_data) {
+                    // 새로운 WiFi 데이터가 왔으면 재시도 카운터 리셋
+                    retry_count = 0;
+                    wifi_fail_sent = false;
+                    strncpy(last_ble_wifi_id, ble_wifi_id, sizeof(last_ble_wifi_id) - 1);
+                    last_ble_wifi_id[sizeof(last_ble_wifi_id) - 1] = '\0';
+                    strncpy(last_ble_wifi_pw, ble_wifi_pw, sizeof(last_ble_wifi_pw) - 1);
+                    last_ble_wifi_pw[sizeof(last_ble_wifi_pw) - 1] = '\0';
+                    ESP_LOGI(GATTS_TAG, "새로운 WiFi 데이터 감지! 재시도 카운터 리셋");
+                }
+                
+                // 최대 재시도 횟수를 초과했으면 시도하지 않음
+                if (retry_count >= MAX_RETRIES) {
+                    ESP_LOGW(GATTS_TAG, "최대 재시도 횟수 초과. 새로운 WiFi 데이터를 기다리는 중...");
+                    vTaskDelay(pdMS_TO_TICKS(1000)); // 1초 대기
+                    continue; // 다음 루프로 건너뛰기
+                }
+                
+                retry_count++;
+                ESP_LOGI(GATTS_TAG, "BLE WiFi 존재! (시도 횟수: %d/%d)", retry_count, MAX_RETRIES);
+                ESP_LOGI(GATTS_TAG, "ID: %s, PW: %s, Email: %s", ble_wifi_id, ble_wifi_pw, ble_user_email);
+
+                // WiFi 연결 시도 
+                bool wifi_connected = connect_to_wifi(ble_wifi_id, ble_wifi_pw);
+                ESP_LOGI(GATTS_TAG, "WiFi 연결 시도 중...");
+                
+                if (wifi_connected) {
+                    ESP_LOGI(GATTS_TAG, "WiFi 연결 성공!");
+                    send_ble_message("wifi connected success\n");
+                    
+                    // 성공 시 모든 플래그 리셋
+                    wifi_fail_sent = false;
+                    retry_count = 0;
+                    memset(last_ble_wifi_id, 0, sizeof(last_ble_wifi_id));
+                    memset(last_ble_wifi_pw, 0, sizeof(last_ble_wifi_pw));
+                    
+                    // WiFi 연결 안정화를 위해 잠시 대기
+                    ESP_LOGI(GATTS_TAG, "WiFi 연결 안정화 대기 중...");
+                    vTaskDelay(pdMS_TO_TICKS(3000)); // 3초 대기
+                    
+                    // ESP_LOGI(GATTS_TAG, "HTTP 요청 전송 시작");
+                    // send_http_post("/hub/request", "http send success");
+                    break; // 성공 시에만 루프 종료
+                } else {
+                    ESP_LOGE(GATTS_TAG, "WiFi 연결 실패! (시도 횟수: %d/%d)", retry_count, MAX_RETRIES);
+                    
+                    if(retry_count >= MAX_RETRIES) {
+                        // 최대 재시도 횟수에 도달했을 때만 실패 메시지 전송
+                        if (!wifi_fail_sent) {
+                            send_ble_message("wifi connect fail\n");
+                            wifi_fail_sent = true;
+                        }
+                        
+                        ESP_LOGI(GATTS_TAG, "최대 재시도 횟수 도달. 새로운 WiFi 데이터를 기다리는 중...");
+                    }
+                }
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(1000)); // 1초 대기
+        }
+    } 
+    
+
+
+
+
+   
+
+    // MAC address 초기화
+    // init_mac_address();
+    // const char* local_mac_address = get_mac_address();
+    // ESP_LOGI(GATTS_TAG, "Local MAC Address: %s", local_mac_address);
+
+    // NVS에서 WiFi ID 로드
+    
+
+    // ESP_LOGI(GATTS_TAG, "BLE 서버 초기화 완료. 앱에서 연결을 기다리는 중...");
+
+    // while (1) {
+    //     // 더 엄격한 BLE 연결 상태 확인
+    //     if (ble_connected && 
+    //         gl_profile_tab[PROFILE_A_APP_ID].descr_handle && 
+    //         descr_value == 0x0001 &&
+    //         gl_profile_tab[PROFILE_A_APP_ID].gatts_if != ESP_GATT_IF_NONE) {
+            
+    //         if (wifi_id_from_nvs && strlen(wifi_id_from_nvs) > 0) {
+    //             send_ble_message("hello from ESP32 111");
+    //             ESP_LOGI(GATTS_TAG, "WiFi ID from NVS: %s", wifi_id_from_nvs);
+    //         } else {
+    //             send_ble_message("hello from ESP32 222");
+    //             ESP_LOGI(GATTS_TAG, "WiFi ID from NVS is empty");
+    //         }
+    //     } else {
+    //         ESP_LOGI(GATTS_TAG, "BLE 연결 또는 Notify 활성화 대기 중...");
+    //         ESP_LOGI(GATTS_TAG, "상태 - connected:%d, descr_handle:%d, descr_value:0x%04x, conn_id:%d, gatts_if:%d", 
+    //                  ble_connected, gl_profile_tab[PROFILE_A_APP_ID].descr_handle, descr_value,
+    //                  gl_profile_tab[PROFILE_A_APP_ID].conn_id, gl_profile_tab[PROFILE_A_APP_ID].gatts_if);
+    //     }
+
+    //     vTaskDelay(pdMS_TO_TICKS(1000));  // 1초 대기
+    // }
+
+    // 실제로 while(1) 때문에 여기까지 도달하지 않음
+    // if (wifi_id_from_nvs) {
+    //     free(wifi_id_from_nvs);
+    // }
+}

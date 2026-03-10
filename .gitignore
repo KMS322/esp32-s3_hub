@@ -1,0 +1,27 @@
+# ========== ESP-IDF 빌드 ==========
+build/
+sdkconfig.old
+
+# Component Manager가 받아오는 컴포넌트 (dependencies.lock만 커밋, 복원은 idf.py reconfigure 시 자동)
+managed_components/
+
+# ========== Node.js ==========
+node_modules/
+
+# ========== IDE / 에디터 ==========
+# 이 PC 전용 경로(ESP-IDF 경로, COM 포트 등)가 들어가므로 제외 권장
+# 다른 PC에서는 각자 "ESP-IDF: Configure ESP-IDF Extension" 후 포트만 설정
+.vscode/settings.json
+
+# ========== OS / 기타 ==========
+.DS_Store
+Thumbs.db
+*.pyc
+__pycache__/
+*.log
+*.swp
+*~
+
+# 로컬만 쓰는 파일 (필요 시 추가)
+# .env
+# *.local
