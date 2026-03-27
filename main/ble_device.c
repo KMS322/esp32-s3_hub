@@ -25,6 +25,7 @@ bool device_found = false;
 #define MAX_SCAN_DEVICES 10
 typedef struct {
     uint8_t mac_address[6];
+    esp_ble_addr_type_t addr_type;
     bool is_used;
 } scanned_device_t;
 
@@ -49,6 +50,35 @@ static bool is_scanning = false;
 static bool is_connecting = false;
 static bool is_connected = false;
 static esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
+
+static esp_err_t gattc_open_with_fallback(esp_gatt_if_t gattc_if, const esp_bd_addr_t bda, esp_ble_addr_type_t primary_type)
+{
+    // 1) primary 타입 먼저 시도
+    esp_err_t ret = esp_ble_gattc_open(gattc_if, bda, primary_type, true);
+    if (ret == ESP_OK) {
+        return ESP_OK;
+    }
+
+    // 2) 나머지 타입을 순차 fallback (IDF가 지원하는 타입 범위)
+    static const esp_ble_addr_type_t candidates[] = {
+        BLE_ADDR_TYPE_PUBLIC,
+        BLE_ADDR_TYPE_RANDOM,
+        BLE_ADDR_TYPE_RPA_PUBLIC,
+        BLE_ADDR_TYPE_RPA_RANDOM,
+    };
+
+    for (int i = 0; i < (int)(sizeof(candidates) / sizeof(candidates[0])); i++) {
+        if (candidates[i] == primary_type) continue;
+        esp_err_t r2 = esp_ble_gattc_open(gattc_if, bda, candidates[i], true);
+        if (r2 == ESP_OK) {
+            return ESP_OK;
+        }
+        // 계속 fallback
+        ret = r2;
+    }
+
+    return ret;
+}
 
 // NUS UUID (Nordic UART Service)
 // Service UUID: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
@@ -221,13 +251,13 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
         case ESP_GATTC_OPEN_EVT:
             {
                 uint16_t conn_id = param->open.conn_id;
-                ESP_LOGI(TAG, "BLE OPEN 이벤트 - status: %d, conn_id: %d", param->open.status, conn_id);
+                // ESP_LOGI(TAG, "BLE OPEN 이벤트 - status: %d, conn_id: %d", param->open.status, conn_id);
                 
                 // remote_bda는 OPEN 이벤트에 없으므로 CONNECT 이벤트에서 설정
                 // 여기서는 연결 중인 슬롯만 찾기
                 
                 if (param->open.status == ESP_GATT_OK) {
-                    ESP_LOGI(TAG, "BLE 연결 시도 성공 (conn_id=%d), 연결 완료 대기 중", conn_id);
+                    // ESP_LOGI(TAG, "BLE 연결 시도 성공 (conn_id=%d), 연결 완료 대기 중", conn_id);
                     // is_connected는 ESP_GATTC_CONNECT_EVT에서 설정
                 } else {
                     ESP_LOGE(TAG, "BLE 연결 시도 실패 (conn_id=%d): %d", conn_id, param->open.status);
@@ -288,7 +318,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
             if (create_ret == ESP_OK) {
                 char mac_str[18];
                 device_collector_mac_to_string(param->connect.remote_bda, mac_str);
-                ESP_LOGI(TAG, "디바이스 수집기 객체 생성 완료: %s", mac_str);
+                // ESP_LOGI(TAG, "디바이스 수집기 객체 생성 완료: %s", mac_str);
             } else {
                 ESP_LOGE(TAG, "디바이스 수집기 객체 생성 실패: %s", esp_err_to_name(create_ret));
             }
@@ -298,12 +328,12 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
             // MTU 요청 (연결 직후)
             uint16_t conn_id_to_use = (conn != NULL) ? conn->conn_id : g_conn_id;
             esp_err_t mtu_ret = esp_ble_gattc_send_mtu_req(gattc_if, conn_id_to_use);
-            ESP_LOGI(TAG, "MTU req (conn_id=%d): %s", conn_id_to_use, esp_err_to_name(mtu_ret));
+            // ESP_LOGI(TAG, "MTU req (conn_id=%d): %s", conn_id_to_use, esp_err_to_name(mtu_ret));
             
             // MTU 설정은 생략 (필요 시 IDF 버전에 맞는 API로 교체)
             
             // 전체 서비스 탐색 시작
-            ESP_LOGI(TAG, "전체 서비스 탐색 시작 (conn_id=%d)...", conn_id_to_use);
+            // ESP_LOGI(TAG, "전체 서비스 탐색 시작 (conn_id=%d)...", conn_id_to_use);
             esp_ble_gattc_search_service(s_gattc_if, conn_id_to_use, NULL);
             break;
             
@@ -319,42 +349,21 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
                 break;
             }
             
-            ESP_LOGI(TAG, "서비스 발견 (conn_id=%d): start=%d end=%d", conn_id, s, e);
+            // ESP_LOGI(TAG, "서비스 발견 (conn_id=%d): start=%d end=%d", conn_id, s, e);
 
             // 이 서비스 범위에서 NUS TX(Notify) 특성 UUID로 직접 탐색하여 구독 시도
             uint16_t count = 1;
             esp_gattc_char_elem_t ch = {0};
             esp_err_t rc = esp_ble_gattc_get_char_by_uuid(s_gattc_if, conn_id, s, e, NUS_TX_CHAR_UUID, &ch, &count);
             if (rc == ESP_OK && count > 0) {
-                // 연결 컨텍스트에 저장
+                /* 핸들만 저장. 구독/CCCD는 SEARCH_CMPL에서 1회만 수행 — 중복 시 BTC 큐 폭주·malloc 실패 유발 */
                 conn->service_start = s;
                 conn->service_end = e;
                 conn->tx_char_handle = ch.char_handle;
-                
-                // 하위 호환성: 전역 변수도 업데이트
+
                 g_service_start = s;
                 g_service_end = e;
                 g_tx_char_handle = ch.char_handle;
-                ESP_LOGI(TAG, "TX 특성 발견 및 구독 시도 (conn_id=%d) - handle:%d (service %d~%d)", 
-                        conn_id, conn->tx_char_handle, s, e);
-                esp_ble_gattc_register_for_notify(s_gattc_if, conn->remote_bda, conn->tx_char_handle);
-
-                // CCCD 설정
-                esp_bt_uuid_t cccd_uuid = { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG } };
-                esp_gattc_descr_elem_t d = {0};
-                uint16_t dcount = 1;
-                if (esp_ble_gattc_get_descr_by_char_handle(s_gattc_if, conn_id, conn->tx_char_handle, cccd_uuid, &d, &dcount) == ESP_OK && dcount > 0) {
-                    conn->cccd_handle = d.handle;
-                    g_cccd_handle = d.handle; // 하위 호환성
-                    uint8_t notify_en[2] = {0x01, 0x00};
-                    esp_err_t wr = esp_ble_gattc_write_char_descr(s_gattc_if, conn_id, conn->cccd_handle,
-                                          sizeof(notify_en), notify_en,
-                                          ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-                    ESP_LOGI(TAG, "CCCD write(conn_id=%d, handle:%u): %s", conn_id, (unsigned)conn->cccd_handle, esp_err_to_name(wr));
-                    // CCCD 읽기 검증
-                    esp_err_t rr = esp_ble_gattc_read_char_descr(s_gattc_if, conn_id, conn->cccd_handle, ESP_GATT_AUTH_REQ_NONE);
-                    ESP_LOGI(TAG, "CCCD read req (conn_id=%d): %s", conn_id, esp_err_to_name(rr));
-                }
 
                 // RX(Write) 특성도 보조로 획득
                 esp_gattc_char_elem_t chrx = {0};
@@ -363,14 +372,9 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
                     conn->rx_char_handle = chrx.char_handle;
                     conn->rx_char_properties = chrx.properties;  // properties 저장
                     g_rx_char_handle = chrx.char_handle; // 하위 호환성
-                    ESP_LOGI(TAG, "NUS RX(Write) 특성 핸들 (conn_id=%d): %d, properties: 0x%02x", 
-                            conn_id, conn->rx_char_handle, chrx.properties);
-                    
-                    // Write 가능 여부 확인
-                    bool can_write = (chrx.properties & ESP_GATT_CHAR_PROP_BIT_WRITE) != 0;
-                    bool can_write_no_rsp = (chrx.properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) != 0;
-                    ESP_LOGI(TAG, "RX Characteristic Properties - WRITE: %s, WRITE_NO_RSP: %s",
-                            can_write ? "YES" : "NO", can_write_no_rsp ? "YES" : "NO");
+                    // ESP_LOGI(TAG, "NUS RX(Write) 특성 핸들 (conn_id=%d): %d, properties: 0x%02x",
+                    //         conn_id, conn->rx_char_handle, chrx.properties);
+                    // ESP_LOGI(TAG, "RX Characteristic Properties - WRITE: %s, WRITE_NO_RSP: %s", ...);
                 } else {
                     ESP_LOGW(TAG, "NUS RX characteristic을 찾지 못했습니다 (conn_id=%d)", conn_id);
                 }
@@ -380,7 +384,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
             
         case ESP_GATTC_SEARCH_CMPL_EVT: {
             uint16_t conn_id = param->search_cmpl.conn_id;
-            ESP_LOGI(TAG, "서비스 탐색 완료 (conn_id=%d) - status: %d", conn_id, param->search_cmpl.status);
+            // ESP_LOGI(TAG, "서비스 탐색 완료 (conn_id=%d) - status: %d", conn_id, param->search_cmpl.status);
             
             // 연결 컨텍스트 찾기
             device_connection_t* conn = find_connection_by_conn_id(conn_id);
@@ -401,11 +405,12 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
             if (retc == ESP_OK && count > 0) {
                 conn->tx_char_handle = char_elem.char_handle;
                 g_tx_char_handle = char_elem.char_handle; // 하위 호환성
-                ESP_LOGI(TAG, "NUS TX(Notify) 특성 핸들 (conn_id=%d): %d", conn_id, conn->tx_char_handle);
+                // ESP_LOGI(TAG, "NUS TX(Notify) 특성 핸들 (conn_id=%d): %d", conn_id, conn->tx_char_handle);
 
                 // Notify 등록
                 esp_err_t rn = esp_ble_gattc_register_for_notify(s_gattc_if, conn->remote_bda, conn->tx_char_handle);
-                ESP_LOGI(TAG, "register_for_notify (conn_id=%d): %s", conn_id, esp_err_to_name(rn));
+                // ESP_LOGI(TAG, "register_for_notify (conn_id=%d): %s", conn_id, esp_err_to_name(rn));
+                (void)rn;
 
                 // CCCD 찾기 (0x2902)
                 esp_bt_uuid_t cccd_uuid = { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG } };
@@ -416,12 +421,13 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
                 if (retd == ESP_OK && count > 0) {
                     conn->cccd_handle = descr_elem.handle;
                     g_cccd_handle = descr_elem.handle; // 하위 호환성
-                    ESP_LOGI(TAG, "CCCD 핸들 (conn_id=%d): %d", conn_id, conn->cccd_handle);
+                    // ESP_LOGI(TAG, "CCCD 핸들 (conn_id=%d): %d", conn_id, conn->cccd_handle);
                     uint8_t notify_en[2] = {0x01, 0x00};
                     esp_err_t rw = esp_ble_gattc_write_char_descr(s_gattc_if, conn_id, conn->cccd_handle,
                                         sizeof(notify_en), notify_en,
                                         ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-                    ESP_LOGI(TAG, "CCCD write (conn_id=%d): %s", conn_id, esp_err_to_name(rw));
+                    // ESP_LOGI(TAG, "CCCD write (conn_id=%d): %s", conn_id, esp_err_to_name(rw));
+                    (void)rw;
                 } else {
                     ESP_LOGW(TAG, "CCCD를 찾지 못했습니다 (conn_id=%d)", conn_id);
                 }
@@ -438,14 +444,14 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
                     conn->rx_char_handle = char_rx.char_handle;
                     conn->rx_char_properties = char_rx.properties;  // properties 저장
                     g_rx_char_handle = char_rx.char_handle; // 하위 호환성
-                    ESP_LOGI(TAG, "✓ NUS RX(Write) 특성 핸들 발견 (conn_id=%d): handle=%d, properties=0x%02x", 
-                            conn_id, conn->rx_char_handle, char_rx.properties);
-                    
+                    // ESP_LOGI(TAG, "✓ NUS RX(Write) 특성 핸들 발견 (conn_id=%d): handle=%d, properties=0x%02x",
+                    //         conn_id, conn->rx_char_handle, char_rx.properties);
+
                     // Write 가능 여부 확인
                     bool can_write = (char_rx.properties & ESP_GATT_CHAR_PROP_BIT_WRITE) != 0;
                     bool can_write_no_rsp = (char_rx.properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) != 0;
-                    ESP_LOGI(TAG, "  -> WRITE: %s, WRITE_NO_RSP: %s",
-                            can_write ? "YES" : "NO", can_write_no_rsp ? "YES" : "NO");
+                    // ESP_LOGI(TAG, "  -> WRITE: %s, WRITE_NO_RSP: %s",
+                    //         can_write ? "YES" : "NO", can_write_no_rsp ? "YES" : "NO");
                     
                     if (!can_write && !can_write_no_rsp) {
                         ESP_LOGE(TAG, "  -> 경고: RX characteristic이 write를 지원하지 않습니다!");
@@ -460,40 +466,6 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
                 ESP_LOGW(TAG, "NUS TX(Notify) 특성을 찾지 못했습니다 (conn_id=%d)", conn_id);
             }
 
-            // 추가: 서비스 내 모든 특성 중 Notify/Indicate 속성을 가진 특성 자동 구독
-            {
-                uint16_t ccount = 0;
-                if (esp_ble_gattc_get_attr_count(s_gattc_if, conn_id,
-                        ESP_GATT_DB_CHARACTERISTIC, conn->service_start, conn->service_end, 0, &ccount) == ESP_GATT_OK && ccount > 0) {
-                    esp_gattc_char_elem_t *chars = (esp_gattc_char_elem_t*)malloc(sizeof(esp_gattc_char_elem_t) * ccount);
-                    if (chars) {
-                        if (esp_ble_gattc_get_all_char(s_gattc_if, conn_id, conn->service_start, conn->service_end, chars, &ccount, 0) == ESP_OK) {
-                            for (int i = 0; i < ccount; i++) {
-                                uint8_t prop = chars[i].properties;
-                                bool wants_notify = (prop & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0;
-                                bool wants_indicate = (prop & ESP_GATT_CHAR_PROP_BIT_INDICATE) != 0;
-                                if (wants_notify || wants_indicate) {
-                                    uint16_t h = chars[i].char_handle;
-                                    ESP_LOGI(TAG, "자동 구독 대상 특성 (conn_id=%d) handle:%u prop:0x%02x", conn_id, (unsigned)h, prop);
-                                    esp_ble_gattc_register_for_notify(s_gattc_if, conn->remote_bda, h);
-                                    // CCCD 찾기 및 설정
-                                    esp_bt_uuid_t cccd_uuid = { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG } };
-                                    esp_gattc_descr_elem_t descr = {0};
-                                    uint16_t dcount = 1;
-                                    if (esp_ble_gattc_get_descr_by_char_handle(s_gattc_if, conn_id, h, cccd_uuid, &descr, &dcount) == ESP_OK && dcount > 0) {
-                                        uint8_t val[2] = { (uint8_t)(wants_notify ? 0x01 : 0x02), 0x00 }; // notify=0x0001, indicate=0x0002
-                                        esp_err_t w = esp_ble_gattc_write_char_descr(s_gattc_if, conn_id, descr.handle,
-                                                                sizeof(val), val,
-                                                                ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-                                        ESP_LOGI(TAG, "CCCD set (conn_id=%d, handle:%u) -> %s", conn_id, (unsigned)descr.handle, esp_err_to_name(w));
-                                    }
-                                }
-                            }
-                        }
-                        free(chars);
-                    }
-                }
-            }
             break;
         }
             
@@ -527,11 +499,13 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
             break;
             
         case ESP_GATTC_REG_FOR_NOTIFY_EVT:
-            ESP_LOGI(TAG, "Notification 등록 완료! - status: %d", param->reg_for_notify.status);
+            // ESP_LOGI(TAG, "Notification 등록 완료! - status: %d", param->reg_for_notify.status);
+            (void)param;
             break;
         
         case ESP_GATTC_WRITE_DESCR_EVT: {
-            ESP_LOGI(TAG, "WRITE_DESCR_EVT - status:%d handle:%d", param->write.status, param->write.handle);
+            // ESP_LOGI(TAG, "WRITE_DESCR_EVT - status:%d handle:%d", param->write.status, param->write.handle);
+            (void)param;
             // CCCD 활성화 완료 로그만 남기고 추가 트리거 전송은 수행하지 않음
             break;
         }
@@ -697,6 +671,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                         if (!already_scanned && scanned_device_count < MAX_SCAN_DEVICES) {
                             // 리스트에 추가
                             memcpy(scanned_devices[scanned_device_count].mac_address, param->scan_rst.bda, 6);
+                            scanned_devices[scanned_device_count].addr_type = param->scan_rst.ble_addr_type;
                             scanned_devices[scanned_device_count].is_used = false;
                             scanned_device_count++;
                             
@@ -704,6 +679,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                                     scanned_device_count, MAX_SCAN_DEVICES,
                                     param->scan_rst.bda[0], param->scan_rst.bda[1], param->scan_rst.bda[2],
                                     param->scan_rst.bda[3], param->scan_rst.bda[4], param->scan_rst.bda[5]);
+                            // ESP_LOGI(TAG, "  - addr_type: %d", (int)param->scan_rst.ble_addr_type);
                         }
                         
                         // 단일 연결 호환성 (첫 번째 발견된 디바이스)
@@ -777,7 +753,7 @@ esp_err_t ble_device_init(void) {
         return ESP_OK;
     }
     
-    ESP_LOGI(TAG, "BLE 클라이언트 초기화 시작");
+    // ESP_LOGI(TAG, "BLE 클라이언트 초기화 시작");
     
     // 연결 배열 초기화
     memset(connections, 0, sizeof(connections));
@@ -785,7 +761,8 @@ esp_err_t ble_device_init(void) {
     scanned_device_count = 0;
     memset(scanned_devices, 0, sizeof(scanned_devices));
     
-    // BT 컨트롤러 초기화
+    // BT 컨트롤러 초기화 (IDF BLE_INIT 배너 로그 비표시)
+    esp_log_level_set("BLE_INIT", ESP_LOG_NONE);
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t ret = esp_bt_controller_init(&bt_cfg);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
@@ -1123,10 +1100,11 @@ int ble_device_connect_multiple(void) {
         }
         
         uint8_t* mac = scanned_devices[i].mac_address;
+        esp_ble_addr_type_t addr_type = scanned_devices[i].addr_type;
         char mac_str[18];
         device_collector_mac_to_string(mac, mac_str);
         
-        ESP_LOGI(TAG, "[%d/%d] 연결 시도: %s", i + 1, scanned_device_count, mac_str);
+        ESP_LOGI(TAG, "[%d/%d] 연결 시도: %s (addr_type=%d)", i + 1, scanned_device_count, mac_str, (int)addr_type);
         
         // 연결 컨텍스트 할당
         device_connection_t* conn = allocate_connection();
@@ -1138,21 +1116,16 @@ int ble_device_connect_multiple(void) {
         conn->is_connecting = true;
         memcpy(conn->remote_bda, mac, 6);
         
-        // RANDOM으로 먼저 시도
-        esp_err_t ret = esp_ble_gattc_open(s_gattc_if, mac, BLE_ADDR_TYPE_RANDOM, true);
+        // 스캔에서 관측된 addr_type으로 먼저 시도 후, 나머지 타입 fallback
+        esp_err_t ret = gattc_open_with_fallback(s_gattc_if, mac, addr_type);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "[%d/%d] RANDOM 타입으로 연결 실패: %s", i + 1, scanned_device_count, esp_err_to_name(ret));
-            // PUBLIC으로 재시도
-            ret = esp_ble_gattc_open(s_gattc_if, mac, BLE_ADDR_TYPE_PUBLIC, true);
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "[%d/%d] PUBLIC 타입으로도 연결 실패: %s", i + 1, scanned_device_count, esp_err_to_name(ret));
-                conn->is_connecting = false;
-                continue;
-            }
+            ESP_LOGE(TAG, "[%d/%d] GATTC open 실패 (fallback 포함): %s", i + 1, scanned_device_count, esp_err_to_name(ret));
+            conn->is_connecting = false;
+            continue;
         }
         
         // 연결 완료 대기 (최대 15초)
-        int timeout = 15;
+        int timeout = 20;
         while (conn->is_connecting && !conn->is_connected && timeout > 0) {
             vTaskDelay(pdMS_TO_TICKS(500));
             timeout--;

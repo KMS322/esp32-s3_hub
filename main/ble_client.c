@@ -302,6 +302,7 @@ esp_err_t ble_client_init(void) {
   
   // BT 컨트롤러 초기화 시도
   ESP_LOGI(TAG, "BT 컨트롤러 확인 중...");
+  esp_log_level_set("BLE_INIT", ESP_LOG_NONE);
   esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
   ret = esp_bt_controller_init(&bt_cfg);
   if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {

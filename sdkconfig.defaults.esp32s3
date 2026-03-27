@@ -1,7 +1,21 @@
-# This file was generated using idf.py save-defconfig. It can be edited manually.
-# Espressif IoT Development Framework (ESP-IDF) Project Minimal Configuration
+# ESP32-S3 (16MB flash). WiFi + BLE + MQTT hub.
+# SPIRAM: if board has NO octal PSRAM (or esp_psram_init IllegalInstruction), keep SPIRAM off.
+# Real N16R8 (8MB OPI PSRAM): set CONFIG_SPIRAM=y in menuconfig and match Oct/40M; then re-enable BT SPIRAM options.
 #
 CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_BT_ENABLED=y
 # CONFIG_BT_BLE_50_FEATURES_SUPPORTED is not set
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_ACL_CONNECTIONS=5
+
+# CONFIG_SPIRAM is not set
+# CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST is not set
+
+# Performance
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+CONFIG_BT_BTC_TASK_STACK_SIZE=10240
+CONFIG_BT_BTU_TASK_STACK_SIZE=10240

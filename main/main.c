@@ -29,6 +29,7 @@
 #include "web_socket.h"
 // GPIO 제어
 #include "gpio_control.h"
+#include "hub_led.h"
 // 디바이스 수집기
 #include "device_collector.h"
 // USB 통신
@@ -162,12 +163,24 @@ uint8_t target_macs[][6] = {
     {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56}   // 두 번째 MAC
 };
 
+/** NVS 가득 참/포맷 불일치 시 파티션 지우고 재초기화 (ESP-IDF 권장) */
+static esp_err_t hub_nvs_flash_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(GATTS_TAG, "NVS: %s — erase & re-init", esp_err_to_name(ret));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    return ret;
+}
+
 void app_main(void)
 {
     ESP_LOGI(GATTS_TAG, "=== 허브 시작 ===");
-    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(hub_nvs_flash_init());
     ESP_ERROR_CHECK(gpio_control_init());
-    ws2812_set_brightness(15);
+    hub_led_init(HUB_LED_DEFAULT_BRIGHTNESS);
     // 디바이스 수집기 초기화
     ESP_ERROR_CHECK(device_collector_init());
     
@@ -175,9 +188,9 @@ void app_main(void)
     // delete_nvs(NVS_WIFI_PW);
     // delete_nvs(NVS_USER_EMAIL);
     // delete_nvs(NVS_MAC_ADDRESS);
-    // save_nvs(NVS_WIFI_ID, "iptime");
-    // save_nvs(NVS_WIFI_PW, "");
-    // save_nvs(NVS_USER_EMAIL, "a@a.com");
+    // save_nvs(NVS_WIFI_ID, "kms");
+    // save_nvs(NVS_WIFI_PW, "12344321");
+    // save_nvs(NVS_USER_EMAIL, "n@n.com");
 
     // init_mac_address();
     // const char* local_mac_address = get_mac_address();
@@ -187,15 +200,16 @@ void app_main(void)
         switch(current_state) {
             case STATE_HUB_INIT:
                 ESP_LOGI(GATTS_TAG, "###### STATE_HUB_INIT 진입 ######");
-                ESP_ERROR_CHECK(nvs_flash_init());
+                ESP_ERROR_CHECK(hub_nvs_flash_init());
                         
                 wifi_id_from_nvs = load_nvs(NVS_WIFI_ID);
-                ws2812_set_color(255, 0, 0);
-    
+
                 if(wifi_id_from_nvs && strlen(wifi_id_from_nvs) > 0) {
+                    hub_led_set_mode(HUB_LED_MODE_WIFI_CONNECTING);
                     wifi_pw_from_nvs = load_nvs(NVS_WIFI_PW);
                     current_state = STATE_NVS_WIFI_EXIST;
                 } else {
+                    hub_led_set_mode(HUB_LED_MODE_BOOT_NO_WIFI);
                     current_state = STATE_NVS_WIFI_NOT_EXIST;
                 }
 
@@ -208,7 +222,7 @@ void app_main(void)
                     ESP_LOGI(GATTS_TAG, "Local MAC Address: %s", mac_address_from_nvs);
                 }
 
-                ws2812_set_color(0, 255, 0);
+                hub_led_set_mode(HUB_LED_MODE_MQTT_CONNECTING);
                 
                 // WiFi 연결 상태 확인
                 if (!wifi_connected) {
@@ -222,6 +236,7 @@ void app_main(void)
                 esp_err_t ret = mqtt_init();
                 if (ret != ESP_OK) {
                     ESP_LOGE(GATTS_TAG, "MQTT 초기화 실패: %s", esp_err_to_name(ret));
+                    hub_led_set_error(HUB_LED_ERR_MQTT_INIT);
                     vTaskDelay(pdMS_TO_TICKS(2000));
                     break;
                 }
@@ -236,6 +251,7 @@ void app_main(void)
                         break;
                     } else {
                         ESP_LOGE(GATTS_TAG, "MQTT 연결 시간 초과");
+                        hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
                         mqtt_deinit();
                         init_wait_count = 0;
                         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -273,16 +289,20 @@ void app_main(void)
                         mqtt_ready_sent = true;
                     } else {
                         ESP_LOGW(GATTS_TAG, "MQTT ready 메시지 전송 실패: %s", esp_err_to_name(send_ret));
+                        hub_led_set_error(HUB_LED_ERR_MQTT_PUBLISH);
                     }
                 }
 
+                if (mqtt_ready_sent) {
+                    hub_led_set_mode(HUB_LED_MODE_ONLINE);
+                }
                 current_state = STATE_MQTT_DATA_RECEIVE;
                 break;
             
             case STATE_MQTT_DATA_RECEIVE:
                 // MQTT 데이터 수신 대기
                 if (mqtt_data_received) {
-                    ESP_LOGI(GATTS_TAG, "MQTT 데이터 수신: %s", mqtt_received_data);
+                    // ESP_LOGI(GATTS_TAG, "MQTT 데이터 수신: %s", mqtt_received_data);
                     
                     // "connect:devices" 또는 "blink:mac_address" 형식 파싱
                     char* colon_pos = strchr(mqtt_received_data, ':');
@@ -374,10 +394,15 @@ void app_main(void)
                                             ESP_LOGI(GATTS_TAG, "state 응답 전송 성공");
                                         } else {
                                             ESP_LOGE(GATTS_TAG, "state 응답 전송 실패");
+                                            hub_led_set_error(HUB_LED_ERR_MQTT_PUBLISH);
                                         }
+                                    } else {
+                                        hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
                                     }
 
                                     free(json_string);
+                                } else {
+                                    hub_led_set_error(HUB_LED_ERR_MEMORY);
                                 }
                                 cJSON_Delete(json_array);
                             }
@@ -402,6 +427,7 @@ void app_main(void)
                         ESP_LOGI(GATTS_TAG, "타겟 디바이스(%s)로 데이터 전송 성공", target_device_mac_address);
                     } else {
                         ESP_LOGW(GATTS_TAG, "타겟 디바이스(%s)로 데이터 전송 실패", target_device_mac_address);
+                        hub_led_set_error(HUB_LED_ERR_BLE_SEND);
                     }
 
                     // 전송 후 MAC 주소 초기화
@@ -422,12 +448,12 @@ void app_main(void)
 
                 // MAC 주소가 비어있지 않은지 확인
                 if (strlen(target_device_mac_address) > 0) {
-                    int result = ble_target_device_send_message(target_device_mac_address, "MODE:A");
-                    // int result = ble_target_device_send_message(target_device_mac_address, "MODE:C");
+                    int result = ble_target_device_send_message(target_device_mac_address, "MODE:C");
                     if (result > 0) {
                         ESP_LOGI(GATTS_TAG, "타겟 디바이스(%s)로 데이터 전송 성공", target_device_mac_address);
                     } else {
                         ESP_LOGW(GATTS_TAG, "타겟 디바이스(%s)로 데이터 전송 실패", target_device_mac_address);
+                        hub_led_set_error(HUB_LED_ERR_BLE_SEND);
                     }
 
                     // 전송 후 MAC 주소 초기화
@@ -452,6 +478,7 @@ void app_main(void)
                         ESP_LOGI(GATTS_TAG, "타겟 디바이스(%s)로 데이터 전송 성공", target_device_mac_address);
                     } else {
                         ESP_LOGW(GATTS_TAG, "타겟 디바이스(%s)로 데이터 전송 실패", target_device_mac_address);
+                        hub_led_set_error(HUB_LED_ERR_BLE_SEND);
                     }
 
                     // 전송 후 MAC 주소 초기화
@@ -477,6 +504,7 @@ void app_main(void)
                         ESP_LOGI(GATTS_TAG, "타겟 디바이스(%s) 연결 해제 성공", target_device_mac_address);
                     } else {
                         ESP_LOGW(GATTS_TAG, "타겟 디바이스(%s) 연결 해제 실패", target_device_mac_address);
+                        hub_led_set_error(HUB_LED_ERR_BLE_CONNECT);
                     }
 
                     // 연결 해제 후 MAC 주소 초기화
@@ -494,9 +522,11 @@ void app_main(void)
             // nvs에 wifi id가 존재하는 경우
             case STATE_NVS_WIFI_EXIST:
                 ESP_LOGI(GATTS_TAG, "###### STATE_NVS_WIFI_EXIST 진입 ######");
+                hub_led_set_mode_if_changed(HUB_LED_MODE_WIFI_CONNECTING);
                 ESP_LOGI(GATTS_TAG, "nvs wifi id : %s", wifi_id_from_nvs);
                 wifi_pw_from_nvs = load_nvs(NVS_WIFI_PW);
                 if(!is_wifi_initialized()) {
+                    wifi_set_sta_credentials(wifi_id_from_nvs, wifi_pw_from_nvs);
                     ESP_ERROR_CHECK(wifi_init());
                 }
                 if(!wifi_connected) {
@@ -513,6 +543,8 @@ void app_main(void)
                         
                         if(nvs_wifi_retry_count >= NVS_WIFI_MAX_RETRIES) {
                             ESP_LOGE(GATTS_TAG, "WiFi 연결 최대 재시도 횟수 도달 - NVS WiFi 정보 삭제 및 BLE 모드로 전환");
+                            hub_led_set_error(HUB_LED_ERR_WIFI);
+                            vTaskDelay(pdMS_TO_TICKS(6000));
                             // NVS에서 WiFi 정보 삭제
                             delete_nvs(NVS_WIFI_ID);
                             delete_nvs(NVS_WIFI_PW);
@@ -528,6 +560,7 @@ void app_main(void)
                             }
                             
                             nvs_wifi_retry_count = 0; // 재시도 카운터 리셋
+                            hub_led_set_mode(HUB_LED_MODE_USB_WAIT);
                             current_state = STATE_NVS_WIFI_NOT_EXIST;
                         } else {
                             // 재시도 대기 후 다시 시도
@@ -544,6 +577,7 @@ void app_main(void)
             // nvs에 wifi id가 존재하지 않는 경우
               case STATE_NVS_WIFI_NOT_EXIST: 
                 ESP_LOGI(GATTS_TAG, "###### STATE_NVS_WIFI_NOT_EXIST 진입 ######");
+                hub_led_set_mode(HUB_LED_MODE_USB_WAIT);
                 // if (!is_ble_initialized()) {
                 //     ESP_ERROR_CHECK(ble_init());
                 //     // ESP_ERROR_CHECK(ble_start_advertising());
@@ -556,26 +590,27 @@ void app_main(void)
 
             case STATE_USB_WAIT_ACCOUNT:
                 {
+                    if (!usb_init_done) {
+                        hub_led_set_mode_if_changed(HUB_LED_MODE_USB_WAIT);
+                    } else {
+                        hub_led_set_mode_if_changed(HUB_LED_MODE_USB_LINE_OK);
+                    }
                     // USB 초기화 (한 번만 실행)
                     if (!usb_init_done) {
                         esp_err_t ret = usb_init();
                         if (ret == ESP_OK) {
                             usb_init_done = true;
-                            ws2812_blink_stop();
-                            ws2812_blink_start_rgb(0, 0, 255);  // 파란색: 초기화 완료
+                            hub_led_set_mode(HUB_LED_MODE_USB_LINE_OK);
                             usb_connected_message_sent = false; // 연결 메시지 전송 플래그 리셋
                         } else {
-                            // 초기화 실패
-                            ws2812_blink_start_rgb(255, 0, 255);
-                            vTaskDelay(pdMS_TO_TICKS(5000));  // 빨간색: 초기화 실패
+                            hub_led_set_error(HUB_LED_ERR_USB_CDC);
+                            vTaskDelay(pdMS_TO_TICKS(5000));
                         }
                     }
                     
                     // 초기화가 완료된 경우에만 데이터 전송 및 수신 처리
                     if (usb_init_done) {
                         // USB 연결 메시지 한 번만 전송
-                        ws2812_blink_stop();
-                        ws2812_set_color(0, 0, 255);  // 파란색: 초기화 완료
                         if (!usb_connected_message_sent) {
                             esp_err_t send_ret = usb_send_data("usb connected\n");
                             if (send_ret == ESP_OK) {
@@ -644,10 +679,10 @@ void app_main(void)
                                     }
                                 }
                                 retry_count = 0; // WiFi 연결 시도 전에 재시도 카운터 리셋
+                                hub_led_set_mode(HUB_LED_MODE_WIFI_CONNECTING);
                                 current_state = STATE_WIFI_CONNECT_TRY;
                                 ESP_LOGI(GATTS_TAG, "###### STATE_WIFI_CONNECT_TRY로 case 전환 ######");
                             }
-                            ws2812_set_color(0, 0, 255);
                         }
                         
                     }
@@ -661,6 +696,7 @@ void app_main(void)
             // 성공하면 nvs에 저장하고 실패하면 다시 대기 모드로 돌아감
             case STATE_WIFI_CONNECT_TRY:
                 ESP_LOGI(GATTS_TAG, "###### STATE_WIFI_CONNECT_TRY 진입 ######");
+                hub_led_set_mode_if_changed(HUB_LED_MODE_WIFI_CONNECTING);
                 ESP_LOGI(GATTS_TAG, "retry_count: %d", retry_count);
                 ESP_LOGI(GATTS_TAG, "MAX_RETRIES: %d", MAX_RETRIES);
                 
@@ -691,8 +727,11 @@ void app_main(void)
                 }
                 
                 if(retry_count >= MAX_RETRIES) {
+                    hub_led_set_error(HUB_LED_ERR_WIFI);
+                    vTaskDelay(pdMS_TO_TICKS(5000));
                     if (is_usb_mode) {
                         usb_send_data("wifi connect fail\n");
+                        hub_led_set_mode(HUB_LED_MODE_USB_WAIT);
                         current_state = STATE_USB_WAIT_ACCOUNT;
                         ESP_LOGI(GATTS_TAG, "###### STATE_USB_WAIT_ACCOUNT로 case 전환 ######");
                     } else {
@@ -702,6 +741,7 @@ void app_main(void)
                     }
                 } else {
                     if(!is_wifi_initialized()) {
+                        wifi_set_sta_credentials(wifi_id, wifi_pw);
                         ESP_ERROR_CHECK(wifi_init());
                     }
                     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -714,13 +754,16 @@ void app_main(void)
                             send_ble_message("wifi connected success\n");
                             ble_disconnect();
                         }
-                        save_nvs(NVS_WIFI_ID, wifi_id);
-                        save_nvs(NVS_WIFI_PW, wifi_pw);
-                        save_nvs(NVS_USER_EMAIL, user_email);
-    
+                        if (save_nvs(NVS_WIFI_ID, wifi_id) != ESP_OK ||
+                            save_nvs(NVS_WIFI_PW, wifi_pw) != ESP_OK ||
+                            save_nvs(NVS_USER_EMAIL, user_email) != ESP_OK) {
+                            hub_led_set_error(HUB_LED_ERR_NVS_SAVE);
+                        }
                         init_mac_address();
                         const char* local_mac_address = get_mac_address();
-                        save_nvs(NVS_MAC_ADDRESS, local_mac_address);
+                        if (save_nvs(NVS_MAC_ADDRESS, local_mac_address) != ESP_OK) {
+                            hub_led_set_error(HUB_LED_ERR_NVS_SAVE);
+                        }
     
                         // USB 변수 초기화
                         memset(usb_wifi_id, 0, sizeof(usb_wifi_id));
@@ -738,6 +781,7 @@ void app_main(void)
             // express 서버에 hub가 등록되었는지 요청하는 경우
             case STATE_MAC_ADDRESS_CHECK:   
                 ESP_LOGI(GATTS_TAG, "###### STATE_MAC_ADDRESS_CHECK 진입 ######");
+                hub_led_set_mode_if_changed(HUB_LED_MODE_HTTP_CHECKING);
                 // NVS 값이 비어있거나 아직 로드되지 않았다면 로드 (NULL 안전)
                 if (user_email_from_nvs == NULL || strlen(user_email_from_nvs) == 0) {
                     user_email_from_nvs = load_nvs(NVS_USER_EMAIL);
@@ -757,6 +801,8 @@ void app_main(void)
                             if (mac_address_from_nvs != NULL) {
                                 strcpy(mac_address_from_nvs, current_mac);
                                 ESP_LOGI(GATTS_TAG, "현재 MAC 주소 사용: %s", mac_address_from_nvs);
+                            } else {
+                                hub_led_set_error(HUB_LED_ERR_MEMORY);
                             }
                         }
                     }
@@ -767,7 +813,7 @@ void app_main(void)
                     if (strcmp(wifi_ip_address, "0.0.0.0") == 0 || strlen(wifi_ip_address) == 0) {
                         ESP_LOGW(GATTS_TAG, "IP 주소가 할당되지 않음 - 재시도 대기");
                         // WiFi IP 주소 다시 확인
-                        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+                        esp_netif_t *netif = wifi_get_sta_netif();
                         if (netif != NULL) {
                             esp_netif_ip_info_t ip_info;
                             esp_err_t ip_ret = esp_netif_get_ip_info(netif, &ip_info);
@@ -872,11 +918,15 @@ void app_main(void)
                             mqtt_set_topics(clean_mac);
 
                             current_state = STATE_MQTT_INIT;
+                        } else {
+                            ESP_LOGW(GATTS_TAG, "서버 응답에 mqtt server ready 없음");
+                            hub_led_set_error(HUB_LED_ERR_HTTP);
                         }
 
                         vTaskDelay(pdMS_TO_TICKS(30));
                     } else {
                         ESP_LOGE(GATTS_TAG, "HTTP POST 요청 실패");
+                        hub_led_set_error(HUB_LED_ERR_HTTP);
                     }
                 } else {
                     wifi_connected = connect_to_wifi(wifi_id_from_nvs, wifi_pw_from_nvs, wifi_ip_address);
@@ -898,7 +948,7 @@ void app_main(void)
                     vTaskDelay(pdMS_TO_TICKS(3000)); // 3초 대기로 증가 - BT 스택 완전 해제
                 }
 
-                ws2812_blink_start_rgb(0, 255, 0);
+                hub_led_set_mode(HUB_LED_MODE_BLE_SCAN);
 
                 // BLE 클라이언트 초기화 상태 확인
                 ESP_LOGI(GATTS_TAG, "BLE 클라이언트 초기화 상태: %s", ble_device_is_init_func() ? "초기화됨" : "미초기화");
@@ -908,10 +958,11 @@ void app_main(void)
                     esp_err_t ret = ble_device_init();
                     if (ret != ESP_OK) {
                         ESP_LOGE(GATTS_TAG, "BLE 클라이언트 초기화 실패: %s", esp_err_to_name(ret));
+                        hub_led_set_error(HUB_LED_ERR_BLE_SCAN);
                         vTaskDelay(pdMS_TO_TICKS(5000));
                         break;
                     }
-                    ESP_LOGI(GATTS_TAG, "BLE 클라이언트 초기화 완료");
+                    // ESP_LOGI(GATTS_TAG, "BLE 클라이언트 초기화 완료");
                     vTaskDelay(pdMS_TO_TICKS(1000)); // 초기화 후 안정화 대기
                 }
                 // 다중 스캔 및 연결
@@ -923,7 +974,7 @@ void app_main(void)
                     }
                 }
 
-                int scanned_count = ble_device_scan_multiple("Tailing_HUB", device_mac_addresses, mac_count);
+                int scanned_count = ble_device_scan_multiple("Tailing", device_mac_addresses, mac_count);
                 if (scanned_count > 0) {
                     ESP_LOGI(GATTS_TAG, "스캔 완료: %d개 디바이스 발견", scanned_count);
                     
@@ -931,7 +982,8 @@ void app_main(void)
                     int connected_count = ble_device_connect_multiple();
                     if (connected_count > 0) {
                         ESP_LOGI(GATTS_TAG, "다중 연결 성공: %d개 디바이스 연결됨", connected_count);
-                        
+                        bool scan_report_mqtt_ok = false;
+
                         // 연결된 디바이스들의 MAC 주소를 배열에 저장
                         char connected_macs[MAX_DEVICE_COUNT][18] = {0};
                         int mac_count = ble_device_get_connected_mac_addresses(connected_macs, MAX_DEVICE_COUNT);
@@ -962,28 +1014,35 @@ void app_main(void)
                                     esp_err_t mqtt_ret = mqtt_send_data(mqtt_topic, json_string);
                                     if (mqtt_ret == ESP_OK) {
                                         ESP_LOGI(GATTS_TAG, "MQTT 전송 성공");
+                                        scan_report_mqtt_ok = true;
                                     } else {
                                         ESP_LOGE(GATTS_TAG, "MQTT 전송 실패: %s", esp_err_to_name(mqtt_ret));
+                                        hub_led_set_error(HUB_LED_ERR_MQTT_PUBLISH);
                                     }
                                 } else {
                                     ESP_LOGE(GATTS_TAG, "MQTT 연결되지 않음");
+                                    hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
                                 }
                                 
                                 free(json_string);
+                            } else {
+                                hub_led_set_error(HUB_LED_ERR_MEMORY);
                             }
                             cJSON_Delete(json);
                         }
                         
                         // 다음 상태로 전환: STATE_MQTT_DATA_RECEIVE로 복귀
-                        ws2812_blink_stop(); 
-                        ws2812_clear();
-                        ws2812_set_color(0, 255, 0);
+                        if (scan_report_mqtt_ok) {
+                            hub_led_set_mode(HUB_LED_MODE_ONLINE);
+                        }
                         current_state = STATE_MQTT_DATA_RECEIVE;
                     } else {
                         ESP_LOGW(GATTS_TAG, "연결 실패 - 재시도");
+                        hub_led_set_error(HUB_LED_ERR_BLE_CONNECT);
                     }
                 } else {
                     ESP_LOGW(GATTS_TAG, "스캔 실패 또는 디바이스 없음 - 재시도");
+                    hub_led_set_error(HUB_LED_ERR_BLE_SCAN);
                 }
 
                 vTaskDelay(pdMS_TO_TICKS(500));

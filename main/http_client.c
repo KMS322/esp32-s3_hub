@@ -19,6 +19,7 @@ static const char *TAG = "HTTP_CLIENT";
 // static const char* HTTP_SERVER_URL = "http://192.168.0.7:5000/api";
 // static const char* HTTP_SERVER_URL = "http://192.168.0.21:5000/api";
 static const char* HTTP_SERVER_URL = "https://creamoff.o-r.kr/api";
+// static const char* HTTP_SERVER_URL = "https://103.218.159.131/api";
 // static const char* HTTP_SERVER_URL = "http://44.200.80.221:5000";
 
 // HTTP 응답 데이터를 저장할 전역 변수
@@ -93,7 +94,7 @@ char* send_http_post(const char* path, const char* data)
     ESP_LOGI(TAG, "WiFi 연결됨 - SSID: %s, RSSI: %d", ap_info.ssid, ap_info.rssi);
     
     // IP 주소 할당 확인 및 대기
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_t *netif = wifi_get_sta_netif();
     if (netif != NULL) {
         esp_netif_ip_info_t ip_info;
         esp_err_t ip_ret = esp_netif_get_ip_info(netif, &ip_info);

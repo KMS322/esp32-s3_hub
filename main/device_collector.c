@@ -2,10 +2,94 @@
 #include "http_client.h"
 #include "mqtt.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "string.h"
 #include "stdlib.h"
 
 static const char *TAG = "DEVICE_COLLECTOR";
+static char *g_json_work_buf = NULL;
+static size_t g_json_work_buf_size = 0;
+/* 250개 배치 기준 기본 작업 버퍼 (재사용) */
+#define JSON_WORK_BUF_DEFAULT_SIZE (40 * 1024)
+
+static char *get_json_work_buffer(size_t need_size)
+{
+    if (need_size == 0) {
+        return NULL;
+    }
+
+    if (g_json_work_buf != NULL && g_json_work_buf_size >= need_size) {
+        return g_json_work_buf;
+    }
+
+    if (g_json_work_buf != NULL) {
+        free(g_json_work_buf);
+        g_json_work_buf = NULL;
+        g_json_work_buf_size = 0;
+    }
+
+    /* PSRAM 있으면 우선 사용, 없으면 내부 힙 fallback */
+    g_json_work_buf = (char *)heap_caps_malloc(need_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (g_json_work_buf == NULL) {
+        g_json_work_buf = (char *)heap_caps_malloc(need_size, MALLOC_CAP_8BIT);
+    }
+
+    if (g_json_work_buf != NULL) {
+        g_json_work_buf_size = need_size;
+    }
+    return g_json_work_buf;
+}
+
+static void release_json_work_buffer_if_internal_heap(void)
+{
+    if (g_json_work_buf == NULL) {
+        return;
+    }
+#if !CONFIG_SPIRAM
+    /* PSRAM 비활성화 빌드에서는 내부 힙 점유를 오래 유지하지 않음 (BT/HCI malloc 보호) */
+    free(g_json_work_buf);
+    g_json_work_buf = NULL;
+    g_json_work_buf_size = 0;
+#endif
+}
+
+/* JSON escape 후 길이 계산 (널 제외) */
+static size_t json_escaped_length(const char *s)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    size_t n = 0;
+    while (*s != '\0') {
+        unsigned char c = (unsigned char)*s++;
+        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
+            n += 2;  // \" \\ \n \r \t
+        } else if (c < 0x20) {
+            n += 6;  // \u00XX
+        } else {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/** 실제 escape 길이 기반 JSON 크기 추정 */
+static size_t estimate_json_buffer_size(const device_collector_t* device)
+{
+    size_t n = 320u;
+    for (int i = 0; i < device->data_count; i++) {
+        if (device->device_data[i] != NULL) {
+            size_t esc_len = json_escaped_length(device->device_data[i]);
+            n += esc_len + 4u;  // 따옴표 + 콤마 여유
+        }
+    }
+    n += 128u;
+    if (n < 2048u) {
+        n = 2048u;
+    }
+    return n;
+}
 
 // 최대 디바이스 개수 (여러 nrf5340 연결 대비)
 #define MAX_DEVICES 10
@@ -140,6 +224,8 @@ esp_err_t device_collector_init(void) {
     }
 
     is_initialized = true;
+    /* 내부 힙 압박 방지를 위해 init 시 선할당하지 않음.
+     * 업로드 직전에 필요할 때만 할당한다. */
     ESP_LOGI(TAG, "디바이스 수집기 초기화 완료 (최대 %d개 디바이스)", MAX_DEVICES);
     return ESP_OK;
 }
@@ -208,13 +294,14 @@ esp_err_t device_collector_create_device(const uint8_t* mac_address) {
     device->data_count = 0;
     device->is_active = true;
     device->has_start_time = false;
+    device->overflow_warned = false;
 
     // 메타데이터 초기화
-    device->sampling_rate = 0.0f;
-    device->spo2 = 0;
     device->hr = 0;
+    device->spo2 = 0;
     device->temp = 0.0f;
     device->battery = 0;
+    device->gyro = 0;
     memset(device->start_time, 0, sizeof(device->start_time));
 
     // device_data 배열 초기화 (250개로 변경)
@@ -224,10 +311,10 @@ esp_err_t device_collector_create_device(const uint8_t* mac_address) {
 
     char mac_str[18];
     device_collector_mac_to_string(mac_address, mac_str);
-    ESP_LOGI(TAG, "=== 디바이스 객체 생성 완료 ===");
-    ESP_LOGI(TAG, "MAC 주소: %s", mac_str);
-    ESP_LOGI(TAG, "슬롯 인덱스: %d", slot);
-    ESP_LOGI(TAG, "=============================");
+    // ESP_LOGI(TAG, "=== 디바이스 객체 생성 완료 ===");
+    // ESP_LOGI(TAG, "MAC 주소: %s", mac_str);
+    // ESP_LOGI(TAG, "슬롯 인덱스: %d", slot);
+    // ESP_LOGI(TAG, "=============================");
 
     return ESP_OK;
 }
@@ -255,6 +342,9 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
 
     char mac_str[18];
     device_collector_mac_to_string(mac_address, mac_str);
+
+    /* 이번 호출에서 메타데이터(쉼표 4개) 파싱에 성공했을 때만 MQTT 업로드 (센서만 온 패킷과 구분) */
+    bool do_mqtt_upload = false;
 
     // 데이터 복사본 생성 (제어 문자 제거)
     int data_len = strlen(data);
@@ -296,9 +386,12 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
             device->device_data[device->data_count] = data_copy;
             device->data_count++;
         } else {
-            // 250개 초과 시에도 계속 저장 (메타데이터 올 때까지)
-            ESP_LOGW(TAG, "[%s] 센서 데이터가 250개를 초과했습니다 (%d개). 메타데이터 대기 중...",
-                     mac_str, device->data_count);
+            // 250개 초과 시 한 번만 경고 (매 패킷마다 로그하지 않음)
+            if (!device->overflow_warned) {
+                device->overflow_warned = true;
+                ESP_LOGW(TAG, "[%s] 센서 데이터가 250개를 초과했습니다 (%d개). 메타데이터 대기 중...",
+                         mac_str, device->data_count);
+            }
             free(data_copy);
         }
     } else if (comma_count == 3) {
@@ -310,33 +403,35 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
             device->device_data[device->data_count] = data_copy;
             device->data_count++;
         } else {
-            // 250개 초과 시에도 계속 저장 (메타데이터 올 때까지)
-            ESP_LOGW(TAG, "[%s] 센서 데이터가 250개를 초과했습니다 (%d개). 메타데이터 대기 중...",
-                     mac_str, device->data_count);
+            // 250개 초과 시 한 번만 경고 (매 패킷마다 로그하지 않음)
+            if (!device->overflow_warned) {
+                device->overflow_warned = true;
+                ESP_LOGW(TAG, "[%s] 센서 데이터가 250개를 초과했습니다 (%d개). 메타데이터 대기 중...",
+                         mac_str, device->data_count);
+            }
             free(data_copy);
         }
     } else if (comma_count == 4) {
-        // 메타데이터 (sampling_rate, spo2, hr, temp, battery) 수신
-        // 메타데이터가 오면 즉시 데이터 가공 및 전송 시작
+        // 메타데이터: HR, Spo2, Temp, Battery, Gyro (예: "84,98,36.5,100,0")
         ESP_LOGI(TAG, "[%s] 메타데이터 수신 (센서 데이터 %d개 수집됨, 총 수신: %d개): %s",
                  mac_str, device->data_count, g_total_data_received, data_copy);
 
         // 카운터 리셋
         g_total_data_received = 0;
 
-        // 파싱: "49.94,100,120,32.5,100"
-        if (sscanf(data_copy, "%f,%d,%d,%f,%d",
-                  &device->sampling_rate,
-                  &device->spo2,
+        if (sscanf(data_copy, "%d,%d,%f,%d,%d",
                   &device->hr,
+                  &device->spo2,
                   &device->temp,
-                  &device->battery) == 5) {
+                  &device->battery,
+                  &device->gyro) == 5) {
+            do_mqtt_upload = true;
             ESP_LOGI(TAG, "[%s] 메타데이터 파싱 성공", mac_str);
-            ESP_LOGI(TAG, "  sampling_rate: %.2f", device->sampling_rate);
-            ESP_LOGI(TAG, "  spo2: %d", device->spo2);
             ESP_LOGI(TAG, "  hr: %d", device->hr);
-            ESP_LOGI(TAG, "  temp: %.2f", device->temp);
+            ESP_LOGI(TAG, "  spo2: %d", device->spo2);
+            ESP_LOGI(TAG, "  temp: %.1f", device->temp);
             ESP_LOGI(TAG, "  battery: %d", device->battery);
+            ESP_LOGI(TAG, "  gyro: %d", device->gyro);
         } else {
             ESP_LOGE(TAG, "[%s] 메타데이터 파싱 실패: %s", mac_str, data_copy);
             free(data_copy);
@@ -349,34 +444,35 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 메타데이터 수신 완료 확인 (spo2 != 0이면 메타데이터가 파싱된 것)
-    // 데이터 개수와 무관하게 메타데이터만 있으면 전송
-    if (device->spo2 != 0 && device->data_count > 0) {
+    // 메타데이터 라인 파싱 성공 시에만 업로드 (센서만 있는 패킷은 여기서 보내지 않음)
+    if (do_mqtt_upload && device->data_count > 0) {
         ESP_LOGI(TAG, "=== [%s] 데이터 %d개 + 메타데이터 수집 완료! ===", mac_str, device->data_count);
 
-        // 1단계: JSON 생성 (버퍼의 현재 데이터 사용)
-        // JSON 크기 계산: 실제 데이터 개수 기준
-        size_t json_size = 512 + (256 + 3) * device->data_count + 200; // 여유있게 계산
-        char* json_data = (char*)malloc(json_size);
+        // 1단계: JSON 생성 — 필요 바이트만 요청 (항목당 259바이트 가정은 249개 시 ~64KB로 과도함)
+        size_t json_size = estimate_json_buffer_size(device);
+        char* json_data = get_json_work_buffer(json_size);
 
         if (json_data == NULL) {
-            ESP_LOGE(TAG, "[%s] JSON 버퍼 할당 실패", mac_str);
+            ESP_LOGE(TAG, "[%s] JSON 버퍼 할당 실패 (need %zu B, free_heap=%u, min_free=%u)",
+                     mac_str, json_size,
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)esp_get_minimum_free_heap_size());
         } else {
-            // JSON 생성 시작 - 메타데이터 필드 포함
+            // JSON: HR, Spo2, Temp(소수 첫째자리), Battery, Gyro + data 배열 + start_time
             int offset = snprintf(json_data, json_size,
                                  "{\"device_mac_address\":\"%s\","
-                                 "\"sampling_rate\":%.2f,"
-                                 "\"spo2\":%d,"
                                  "\"hr\":%d,"
+                                 "\"spo2\":%d,"
                                  "\"temp\":%.1f,"
                                  "\"battery\":%d,"
+                                 "\"gyro\":%d,"
                                  "\"data\":[",
                                  mac_str,
-                                 device->sampling_rate,
-                                 device->spo2,
                                  device->hr,
+                                 device->spo2,
                                  device->temp,
-                                 device->battery);
+                                 device->battery,
+                                 device->gyro);
 
             // 실제 수집된 센서 데이터를 배열에 추가
             for (int i = 0; i < device->data_count; i++) {
@@ -386,9 +482,11 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
                     }
 
                     // 따옴표와 백슬래시만 이스케이프 처리 (제어 문자는 이미 제거됨)
-                    if (strchr(device->device_data[i], '"') != NULL || strchr(device->device_data[i], '\\') != NULL) {
+                    if (strchr(device->device_data[i], '"') != NULL || strchr(device->device_data[i], '\\') != NULL ||
+                        strchr(device->device_data[i], '\n') != NULL || strchr(device->device_data[i], '\r') != NULL ||
+                        strchr(device->device_data[i], '\t') != NULL) {
                         // 따옴표나 백슬래시가 있으면 이스케이프 필요
-                        size_t escaped_buf_size = strlen(device->device_data[i]) * 2 + 10;
+                        size_t escaped_buf_size = json_escaped_length(device->device_data[i]) + 1;
                         char* escaped_str = (char*)malloc(escaped_buf_size);
                         if (escaped_str != NULL) {
                             json_escape_string(device->device_data[i], escaped_str, escaped_buf_size);
@@ -416,7 +514,7 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
             ESP_LOGI(TAG, "[%s] JSON 생성 완료 (%d bytes, 데이터 %d개)", mac_str, offset, device->data_count);
 
             if (mqtt_is_connected()) {
-                const char* mqtt_topic = "hub/80:b5:4e:db:44:9a/send";
+                const char* mqtt_topic = mqtt_get_topic();
 
                 esp_err_t mqtt_ret = mqtt_send_data(mqtt_topic, json_data);
                 if (mqtt_ret == ESP_OK) {
@@ -429,7 +527,8 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
                 ESP_LOGW(TAG, "[%s] MQTT 미연결 - MQTT 전송 건너뜀", mac_str);
             }
 
-            free(json_data);
+            /* PSRAM OFF에서는 내부 힙을 즉시 반환해 BT 메모리 고갈을 방지 */
+            release_json_work_buffer_if_internal_heap();
         }
 
         // 3단계: 버퍼 초기화 (MQTT 전송 완료 후)
@@ -443,13 +542,14 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
             }
         }
         device->data_count = 0;
+        device->overflow_warned = false;
 
         // 메타데이터 초기화
-        device->sampling_rate = 0.0f;
-        device->spo2 = 0;
         device->hr = 0;
+        device->spo2 = 0;
         device->temp = 0.0f;
         device->battery = 0;
+        device->gyro = 0;
         device->has_start_time = false;
         memset(device->start_time, 0, sizeof(device->start_time));
 

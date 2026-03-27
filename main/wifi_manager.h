@@ -14,6 +14,8 @@
 #define WIFI_PASSWORD_MAX_LEN 64
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
+/** DHCP로 IP를 받은 뒤 connect_to_wifi()에서 대기할 때만 사용 */
+#define WIFI_GOT_IP_BIT    BIT2
 
 // NVS 키
 #define NVS_WIFI_ID_KEY "nvs_wifi_id"
@@ -33,6 +35,10 @@ extern bool wifi_scan_done;
 extern bool target_wifi_found;
 
 // 함수 선언
+/** esp_wifi_start 전에 반드시 호출 — wifi_init_sta()가 전역 wifi_id/wifi_pw로 설정함 */
+void wifi_set_sta_credentials(const char* ssid, const char* password);
+/** DHCP/ IP 조회 시 항상 이 핸들 사용 (중복 STA netif 방지) */
+esp_netif_t *wifi_get_sta_netif(void);
 void wifi_init_sta(void);
 esp_err_t wifi_init(void);
 bool is_wifi_initialized(void);

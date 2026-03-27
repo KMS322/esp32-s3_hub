@@ -11,18 +11,19 @@ typedef struct {
     char* device_data[250];         // 센서 데이터 배열 (IR,RED,GREEN) 250개
     int data_count;                 // 현재 수집된 데이터 개수
 
-    // 메타데이터 (251번째 패킷에서 받음)
-    float sampling_rate;
-    int spo2;
+    // 메타데이터: 쉼표 4개(필드 5개) — HR, Spo2, Temp, Battery, Gyro (Temp만 소수)
     int hr;
+    int spo2;
     float temp;
     int battery;
+    int gyro;
 
     // 타임스탬프 (첫 데이터 수신 시각)
     char start_time[16];            // HHmmssSSS 형식 (여유 공간 포함)
     bool has_start_time;
 
     bool is_active;                 // 활성 상태 플래그
+    bool overflow_warned;            // 250개 초과 경고를 이미 출력했는지 (로그 스팸 방지)
 } device_collector_t;
 
 // 디바이스 수집기 초기화

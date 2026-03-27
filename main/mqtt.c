@@ -6,7 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
-#include "gpio_control.h"
+#include "hub_led.h"
 #include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
@@ -37,7 +37,8 @@ static int mqtt_init_retry_count = 0;
 // #define MQTT_BROKER_URL "mqtt://192.168.0.7"
 // #define MQTT_BROKER_URL "mqtt://192.168.0.21"
 // #define MQTT_BROKER_URL "mqtt://localhost"
-#define MQTT_BROKER_URL "mqtt://44.200.80.221"
+#define MQTT_BROKER_URL "mqtt://103.218.159.131"
+// #define MQTT_BROKER_URL "mqtt://44.200.80.221"
 #define MQTT_BROKER_PORT 1883
 #define MQTT_USERNAME NULL  // 필요시 설정
 #define MQTT_PASSWORD NULL  // 필요시 설정
@@ -116,14 +117,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         
     case MQTT_EVENT_PUBLISHED:
         {
-            // LED로 전송 성공 표시 (빠른 깜빡임)
-            ws2812_set_color(0, 255, 255); // 청록색: 전송 성공
-            vTaskDelay(pdMS_TO_TICKS(50));
-            ws2812_set_color(0, 255, 0); // 다시 초록색으로
-            
-            printf("[MQTT] 메시지 발행 완료, msg_id=%d\n", event->msg_id);
+            /* MQTT 발행 성공은 LED로 표시하지 않음(정상 유휴=초록 고정과 혼동 방지). */
+
+            // printf("[MQTT] 메시지 발행 완료, msg_id=%d\n", event->msg_id);
             fflush(stdout);
-            ESP_LOGI(TAG, "메시지 발행 완료, msg_id=%d", event->msg_id);
+            // ESP_LOGI(TAG, "메시지 발행 완료, msg_id=%d", event->msg_id);
             
             // 브로커 도달 시간 측정
             if (last_sent_msg_id == event->msg_id && last_send_start_time > 0) {
@@ -131,9 +129,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 int64_t elapsed_us = current_time - last_send_start_time;
                 float elapsed_ms = elapsed_us / 1000.0f;
                 
-                printf("[MQTT] 브로커 도달 시간: %.2f ms (%.3f 초)\n", elapsed_ms, elapsed_ms / 1000.0f);
+                // printf("[MQTT] 브로커 도달 시간: %.2f ms (%.3f 초)\n", elapsed_ms, elapsed_ms / 1000.0f);
                 fflush(stdout);
-                ESP_LOGI(TAG, "브로커 도달 시간: %.2f ms (%.3f 초)", elapsed_ms, elapsed_ms / 1000.0f);
+                // ESP_LOGI(TAG, "브로커 도달 시간: %.2f ms (%.3f 초)", elapsed_ms, elapsed_ms / 1000.0f);
                 
                 // 측정 완료 후 초기화
                 last_sent_msg_id = -1;
@@ -182,7 +180,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             mqtt_received_data[copy_len] = '\0';
             mqtt_data_received = true;
             
-            ESP_LOGI(TAG, "MQTT 데이터 저장 완료: %s", mqtt_received_data);
+            // ESP_LOGI(TAG, "MQTT 데이터 저장 완료: %s", mqtt_received_data);
         }
         break;
         
@@ -212,6 +210,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         }
         ESP_LOGE(TAG, "========================================");
         mqtt_connected = false;
+        hub_led_set_error(HUB_LED_ERR_MQTT_TRANSPORT);
         break;
         
     case MQTT_EVENT_BEFORE_CONNECT:
@@ -431,7 +430,7 @@ static bool mqtt_validate_data_size(size_t data_size)
     }
     
     if (data_size > MQTT_MAX_MESSAGE_SIZE) {
-        ESP_LOGE(TAG, "데이터 크기 초과: %zu bytes (최대: %d bytes)", data_size, MQTT_MAX_MESSAGE_SIZE);
+        // ESP_LOGE(TAG, "데이터 크기 초과: %zu bytes (최대: %d bytes)", data_size, MQTT_MAX_MESSAGE_SIZE);
         return false;
     }
     
