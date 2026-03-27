@@ -4,98 +4,88 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "stdarg.h"
 #include "string.h"
 #include "stdlib.h"
 
 static const char *TAG = "DEVICE_COLLECTOR";
 static char *g_json_work_buf = NULL;
-static size_t g_json_work_buf_size = 0;
-/* 250개 배치 기준 기본 작업 버퍼 (재사용) */
-#define JSON_WORK_BUF_DEFAULT_SIZE (40 * 1024)
-
-static char *get_json_work_buffer(size_t need_size)
-{
-    if (need_size == 0) {
-        return NULL;
-    }
-
-    if (g_json_work_buf != NULL && g_json_work_buf_size >= need_size) {
-        return g_json_work_buf;
-    }
-
-    if (g_json_work_buf != NULL) {
-        free(g_json_work_buf);
-        g_json_work_buf = NULL;
-        g_json_work_buf_size = 0;
-    }
-
-    /* PSRAM 있으면 우선 사용, 없으면 내부 힙 fallback */
-    g_json_work_buf = (char *)heap_caps_malloc(need_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (g_json_work_buf == NULL) {
-        g_json_work_buf = (char *)heap_caps_malloc(need_size, MALLOC_CAP_8BIT);
-    }
-
-    if (g_json_work_buf != NULL) {
-        g_json_work_buf_size = need_size;
-    }
-    return g_json_work_buf;
-}
-
-static void release_json_work_buffer_if_internal_heap(void)
-{
-    if (g_json_work_buf == NULL) {
-        return;
-    }
-#if !CONFIG_SPIRAM
-    /* PSRAM 비활성화 빌드에서는 내부 힙 점유를 오래 유지하지 않음 (BT/HCI malloc 보호) */
-    free(g_json_work_buf);
-    g_json_work_buf = NULL;
-    g_json_work_buf_size = 0;
-#endif
-}
-
-/* JSON escape 후 길이 계산 (널 제외) */
-static size_t json_escaped_length(const char *s)
-{
-    if (s == NULL) {
-        return 0;
-    }
-    size_t n = 0;
-    while (*s != '\0') {
-        unsigned char c = (unsigned char)*s++;
-        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
-            n += 2;  // \" \\ \n \r \t
-        } else if (c < 0x20) {
-            n += 6;  // \u00XX
-        } else {
-            n += 1;
-        }
-    }
-    return n;
-}
-
-/** 실제 escape 길이 기반 JSON 크기 추정 */
-static size_t estimate_json_buffer_size(const device_collector_t* device)
-{
-    size_t n = 320u;
-    for (int i = 0; i < device->data_count; i++) {
-        if (device->device_data[i] != NULL) {
-            size_t esc_len = json_escaped_length(device->device_data[i]);
-            n += esc_len + 4u;  // 따옴표 + 콤마 여유
-        }
-    }
-    n += 128u;
-    if (n < 2048u) {
-        n = 2048u;
-    }
-    return n;
-}
-
+/* 250개 배치 JSON 고정 작업 버퍼 (동적 추정/가변 할당 제거) */
+#define JSON_FIXED_BUF_SIZE (36 * 1024)
 // 최대 디바이스 개수 (여러 nrf5340 연결 대비)
 #define MAX_DEVICES 10
+#define DEVICE_SAMPLE_MAX 250
+#define DEVICE_SAMPLE_STR_MAX 96
+
+static bool json_appendf(char *buf, size_t cap, size_t *off, const char *fmt, ...)
+{
+    if (buf == NULL || off == NULL || *off >= cap) {
+        return false;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *off, cap - *off, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= (cap - *off)) {
+        return false;
+    }
+    *off += (size_t)n;
+    return true;
+}
+
+static bool json_append_quoted_escaped(char *buf, size_t cap, size_t *off, const char *src)
+{
+    if (!json_appendf(buf, cap, off, "\"")) {
+        return false;
+    }
+    if (src != NULL) {
+        while (*src != '\0') {
+            unsigned char c = (unsigned char)(*src++);
+            if (c == '"' || c == '\\') {
+                if (!json_appendf(buf, cap, off, "\\%c", c)) return false;
+            } else if (c == '\n') {
+                if (!json_appendf(buf, cap, off, "\\n")) return false;
+            } else if (c == '\r') {
+                if (!json_appendf(buf, cap, off, "\\r")) return false;
+            } else if (c == '\t') {
+                if (!json_appendf(buf, cap, off, "\\t")) return false;
+            } else if (c < 0x20) {
+                if (!json_appendf(buf, cap, off, "\\u%04x", c)) return false;
+            } else {
+                if (!json_appendf(buf, cap, off, "%c", c)) return false;
+            }
+        }
+    }
+    return json_appendf(buf, cap, off, "\"");
+}
+
+static void reset_device_batch_buffers(device_collector_t *device)
+{
+    if (device == NULL) {
+        return;
+    }
+    for (int i = 0; i < DEVICE_SAMPLE_MAX; i++) {
+        if (device->device_data[i] != NULL) {
+            device->device_data[i][0] = '\0';
+        }
+    }
+    device->data_count = 0;
+    device->overflow_warned = false;
+
+    // 메타데이터 초기화
+    device->hr = 0;
+    device->spo2 = 0;
+    device->temp = 0.0f;
+    device->battery = 0;
+    device->gyro = 0;
+    device->has_start_time = false;
+    memset(device->start_time, 0, sizeof(device->start_time));
+}
 
 // 디버깅용: 총 데이터 수신 카운터
 static int g_total_data_received = 0;
+/* 고정 슬롯: 동적 malloc/free 제거 */
+static char g_device_sample_slots[MAX_DEVICES][DEVICE_SAMPLE_MAX][DEVICE_SAMPLE_STR_MAX];
 
 // 제어 문자 제거 함수 (\n, \r, \t 등 제거)
 static void remove_control_chars(char* str) {
@@ -112,88 +102,6 @@ static void remove_control_chars(char* str) {
         src++;
     }
     *dst = '\0';
-}
-
-// JSON 이스케이프 처리 함수 (제어 문자 처리)
-static int json_escape_string(const char* input, char* output, size_t output_size) {
-    if (input == NULL || output == NULL || output_size == 0) {
-        return 0;
-    }
-    
-    size_t out_pos = 0;
-    const char* in = input;
-    
-    while (*in != '\0' && out_pos < output_size - 1) {
-        unsigned char c = (unsigned char)*in;
-        
-        // 제어 문자 처리 (0x00-0x1F)
-        if (c < 0x20) {
-            switch (c) {
-                case '\n':
-                    if (out_pos + 2 < output_size - 1) {
-                        output[out_pos++] = '\\';
-                        output[out_pos++] = 'n';
-                        in++;
-                    } else {
-                        goto end;
-                    }
-                    break;
-                case '\r':
-                    if (out_pos + 2 < output_size - 1) {
-                        output[out_pos++] = '\\';
-                        output[out_pos++] = 'r';
-                        in++;
-                    } else {
-                        goto end;
-                    }
-                    break;
-                case '\t':
-                    if (out_pos + 2 < output_size - 1) {
-                        output[out_pos++] = '\\';
-                        output[out_pos++] = 't';
-                        in++;
-                    } else {
-                        goto end;
-                    }
-                    break;
-                default:
-                    // 다른 제어 문자는 유니코드 이스케이프로 처리
-                    if (out_pos + 6 < output_size - 1) {
-                        snprintf(output + out_pos, output_size - out_pos, "\\u%04x", c);
-                        out_pos += 6;
-                        in++;
-                    } else {
-                        goto end;
-                    }
-                    break;
-            }
-        } else if (c == '"') {
-            // 따옴표 이스케이프
-            if (out_pos + 2 < output_size - 1) {
-                output[out_pos++] = '\\';
-                output[out_pos++] = '"';
-                in++;
-            } else {
-                goto end;
-            }
-        } else if (c == '\\') {
-            // 백슬래시 이스케이프
-            if (out_pos + 2 < output_size - 1) {
-                output[out_pos++] = '\\';
-                output[out_pos++] = '\\';
-                in++;
-            } else {
-                goto end;
-            }
-        } else {
-            // 일반 문자
-            output[out_pos++] = *in++;
-        }
-    }
-    
-end:
-    output[out_pos] = '\0';
-    return out_pos;
 }
 
 // 디바이스 수집기 배열
@@ -218,14 +126,20 @@ esp_err_t device_collector_init(void) {
         devices[i].is_active = false;
         devices[i].data_count = 0;
         memset(devices[i].mac_address, 0, 6);
-        for (int j = 0; j < 50; j++) {
-            devices[i].device_data[j] = NULL;
+        for (int j = 0; j < DEVICE_SAMPLE_MAX; j++) {
+            g_device_sample_slots[i][j][0] = '\0';
+            devices[i].device_data[j] = g_device_sample_slots[i][j];
         }
     }
 
     is_initialized = true;
-    /* 내부 힙 압박 방지를 위해 init 시 선할당하지 않음.
-     * 업로드 직전에 필요할 때만 할당한다. */
+    /* 고정 버퍼 1회 선할당: 실행 중 가변 할당/파편화 최소화 */
+    if (g_json_work_buf == NULL) {
+        g_json_work_buf = (char *)heap_caps_malloc(JSON_FIXED_BUF_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (g_json_work_buf == NULL) {
+        ESP_LOGW(TAG, "JSON 고정 버퍼 선할당 실패(%d B), 런타임 전송 실패 가능", JSON_FIXED_BUF_SIZE);
+    }
     ESP_LOGI(TAG, "디바이스 수집기 초기화 완료 (최대 %d개 디바이스)", MAX_DEVICES);
     return ESP_OK;
 }
@@ -305,8 +219,9 @@ esp_err_t device_collector_create_device(const uint8_t* mac_address) {
     memset(device->start_time, 0, sizeof(device->start_time));
 
     // device_data 배열 초기화 (250개로 변경)
-    for (int i = 0; i < 250; i++) {
-        device->device_data[i] = NULL;
+    for (int i = 0; i < DEVICE_SAMPLE_MAX; i++) {
+        g_device_sample_slots[slot][i][0] = '\0';
+        device->device_data[i] = g_device_sample_slots[slot][i];
     }
 
     char mac_str[18];
@@ -347,13 +262,9 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
     bool do_mqtt_upload = false;
 
     // 데이터 복사본 생성 (제어 문자 제거)
-    int data_len = strlen(data);
-    char* data_copy = (char*)malloc(data_len + 1);
-    if (data_copy == NULL) {
-        ESP_LOGE(TAG, "메모리 할당 실패");
-        return ESP_ERR_NO_MEM;
-    }
-    strcpy(data_copy, data);
+    char data_copy[DEVICE_SAMPLE_STR_MAX];
+    strncpy(data_copy, data, sizeof(data_copy) - 1);
+    data_copy[sizeof(data_copy) - 1] = '\0';
     remove_control_chars(data_copy);
 
     // 쉼표 개수로 데이터 타입 판별
@@ -382,8 +293,9 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
         // 센서 데이터 (IR,RED,GREEN) - 메타데이터 올 때까지 계속 수집
         g_total_data_received++;  // 디버깅용 카운터
 
-        if (device->data_count < 250) {
-            device->device_data[device->data_count] = data_copy;
+        if (device->data_count < DEVICE_SAMPLE_MAX) {
+            strncpy(device->device_data[device->data_count], data_copy, DEVICE_SAMPLE_STR_MAX - 1);
+            device->device_data[device->data_count][DEVICE_SAMPLE_STR_MAX - 1] = '\0';
             device->data_count++;
         } else {
             // 250개 초과 시 한 번만 경고 (매 패킷마다 로그하지 않음)
@@ -392,15 +304,15 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
                 ESP_LOGW(TAG, "[%s] 센서 데이터가 250개를 초과했습니다 (%d개). 메타데이터 대기 중...",
                          mac_str, device->data_count);
             }
-            free(data_copy);
         }
     } else if (comma_count == 3) {
         // 센서 데이터 with cnt (cnt,IR,RED,GREEN) - 테스트용
         // cnt는 디버깅용이므로 그대로 저장 (서버에서 파싱)
         g_total_data_received++;  // 디버깅용 카운터
 
-        if (device->data_count < 250) {
-            device->device_data[device->data_count] = data_copy;
+        if (device->data_count < DEVICE_SAMPLE_MAX) {
+            strncpy(device->device_data[device->data_count], data_copy, DEVICE_SAMPLE_STR_MAX - 1);
+            device->device_data[device->data_count][DEVICE_SAMPLE_STR_MAX - 1] = '\0';
             device->data_count++;
         } else {
             // 250개 초과 시 한 번만 경고 (매 패킷마다 로그하지 않음)
@@ -409,7 +321,6 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
                 ESP_LOGW(TAG, "[%s] 센서 데이터가 250개를 초과했습니다 (%d개). 메타데이터 대기 중...",
                          mac_str, device->data_count);
             }
-            free(data_copy);
         }
     } else if (comma_count == 4) {
         // 메타데이터: HR, Spo2, Temp, Battery, Gyro (예: "84,98,36.5,100,0")
@@ -434,124 +345,97 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
             ESP_LOGI(TAG, "  gyro: %d", device->gyro);
         } else {
             ESP_LOGE(TAG, "[%s] 메타데이터 파싱 실패: %s", mac_str, data_copy);
-            free(data_copy);
             return ESP_ERR_INVALID_ARG;
         }
-        free(data_copy);
     } else {
         ESP_LOGW(TAG, "[%s] 알 수 없는 데이터 형식 (쉼표 개수: %d): %s", mac_str, comma_count, data_copy);
-        free(data_copy);
         return ESP_ERR_INVALID_ARG;
     }
 
     // 메타데이터 라인 파싱 성공 시에만 업로드 (센서만 있는 패킷은 여기서 보내지 않음)
     if (do_mqtt_upload && device->data_count > 0) {
         ESP_LOGI(TAG, "=== [%s] 데이터 %d개 + 메타데이터 수집 완료! ===", mac_str, device->data_count);
+        bool batch_reset = false;
+        int sent_data_count = device->data_count;
 
-        // 1단계: JSON 생성 — 필요 바이트만 요청 (항목당 259바이트 가정은 249개 시 ~64KB로 과도함)
-        size_t json_size = estimate_json_buffer_size(device);
-        char* json_data = get_json_work_buffer(json_size);
-
+        // 1단계: JSON 생성 — 고정 버퍼 사용
+        char* json_data = g_json_work_buf;
+        size_t json_size = JSON_FIXED_BUF_SIZE;
         if (json_data == NULL) {
-            ESP_LOGE(TAG, "[%s] JSON 버퍼 할당 실패 (need %zu B, free_heap=%u, min_free=%u)",
+            ESP_LOGE(TAG, "[%s] JSON 고정 버퍼 없음 (size=%zu B, free_heap=%u, min_free=%u)",
                      mac_str, json_size,
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)esp_get_minimum_free_heap_size());
         } else {
             // JSON: HR, Spo2, Temp(소수 첫째자리), Battery, Gyro + data 배열 + start_time
-            int offset = snprintf(json_data, json_size,
-                                 "{\"device_mac_address\":\"%s\","
-                                 "\"hr\":%d,"
-                                 "\"spo2\":%d,"
-                                 "\"temp\":%.1f,"
-                                 "\"battery\":%d,"
-                                 "\"gyro\":%d,"
-                                 "\"data\":[",
-                                 mac_str,
-                                 device->hr,
-                                 device->spo2,
-                                 device->temp,
-                                 device->battery,
-                                 device->gyro);
+            size_t offset = 0;
+            bool json_ok = json_appendf(json_data, json_size, &offset,
+                                        "{\"device_mac_address\":\"%s\","
+                                        "\"hr\":%d,"
+                                        "\"spo2\":%d,"
+                                        "\"temp\":%.1f,"
+                                        "\"battery\":%d,"
+                                        "\"gyro\":%d,"
+                                        "\"data\":[",
+                                        mac_str,
+                                        device->hr,
+                                        device->spo2,
+                                        device->temp,
+                                        device->battery,
+                                        device->gyro);
 
             // 실제 수집된 센서 데이터를 배열에 추가
-            for (int i = 0; i < device->data_count; i++) {
-                if (device->device_data[i] != NULL) {
+            for (int i = 0; i < device->data_count && json_ok; i++) {
+                if (device->device_data[i] != NULL && device->device_data[i][0] != '\0') {
                     if (i > 0) {
-                        offset += snprintf(json_data + offset, json_size - offset, ",");
+                        json_ok = json_appendf(json_data, json_size, &offset, ",");
                     }
-
-                    // 따옴표와 백슬래시만 이스케이프 처리 (제어 문자는 이미 제거됨)
-                    if (strchr(device->device_data[i], '"') != NULL || strchr(device->device_data[i], '\\') != NULL ||
-                        strchr(device->device_data[i], '\n') != NULL || strchr(device->device_data[i], '\r') != NULL ||
-                        strchr(device->device_data[i], '\t') != NULL) {
-                        // 따옴표나 백슬래시가 있으면 이스케이프 필요
-                        size_t escaped_buf_size = json_escaped_length(device->device_data[i]) + 1;
-                        char* escaped_str = (char*)malloc(escaped_buf_size);
-                        if (escaped_str != NULL) {
-                            json_escape_string(device->device_data[i], escaped_str, escaped_buf_size);
-                            offset += snprintf(json_data + offset, json_size - offset, "\"%s\"", escaped_str);
-                            free(escaped_str);
-                        } else {
-                            // 메모리 할당 실패 시 원본 사용 (로그 남기고 진행)
-                            ESP_LOGW(TAG, "[%s] 이스케이프 버퍼 할당 실패, 원본 사용", mac_str);
-                            offset += snprintf(json_data + offset, json_size - offset, "\"%s\"",
-                                             device->device_data[i]);
-                        }
-                    } else {
-                        // 따옴표와 백슬래시가 없으면 그대로 사용 (제어 문자는 이미 제거됨)
-                        offset += snprintf(json_data + offset, json_size - offset, "\"%s\"",
-                                         device->device_data[i]);
+                    if (json_ok) {
+                        json_ok = json_append_quoted_escaped(json_data, json_size, &offset, device->device_data[i]);
                     }
                 }
             }
 
             // start_time 추가 및 JSON 종료
-            offset += snprintf(json_data + offset, json_size - offset,
-                             "],\"start_time\":\"%s\"}", device->start_time);
+            if (json_ok) {
+                json_ok = json_appendf(json_data, json_size, &offset, "],\"start_time\":\"%s\"}", device->start_time);
+            }
+            if (!json_ok) {
+                ESP_LOGE(TAG, "[%s] JSON 고정 버퍼 초과 (cap=%zu, data_count=%d)", mac_str, json_size, device->data_count);
+            }
 
-            // 2단계: MQTT 전송 (JSON 생성 완료 후)
-            ESP_LOGI(TAG, "[%s] JSON 생성 완료 (%d bytes, 데이터 %d개)", mac_str, offset, device->data_count);
+            // 2단계: JSON 생성 완료 후, BT 힙 보호를 위해 샘플 버퍼를 먼저 반환
+            ESP_LOGI(TAG, "[%s] JSON 생성 완료 (%u bytes, 데이터 %d개)", mac_str, (unsigned)offset, sent_data_count);
+            if (json_ok) {
+                reset_device_batch_buffers(device);
+                batch_reset = true;
+            }
 
-            if (mqtt_is_connected()) {
+            // 3단계: MQTT 전송
+            if (json_ok && mqtt_is_connected()) {
                 const char* mqtt_topic = mqtt_get_topic();
 
                 esp_err_t mqtt_ret = mqtt_send_data(mqtt_topic, json_data);
                 if (mqtt_ret == ESP_OK) {
                     ESP_LOGI(TAG, "[%s] MQTT 전송 성공 - 토픽: %s, data.length: %d",
-                             mac_str, mqtt_topic, device->data_count);
+                             mac_str, mqtt_topic, sent_data_count);
                 } else {
                     ESP_LOGE(TAG, "[%s] MQTT 전송 실패: %s", mac_str, esp_err_to_name(mqtt_ret));
                 }
             } else {
-                ESP_LOGW(TAG, "[%s] MQTT 미연결 - MQTT 전송 건너뜀", mac_str);
+                if (!json_ok) {
+                    ESP_LOGW(TAG, "[%s] JSON 생성 실패 - MQTT 전송 건너뜀", mac_str);
+                } else {
+                    ESP_LOGW(TAG, "[%s] MQTT 미연결 - MQTT 전송 건너뜀", mac_str);
+                }
             }
-
-            /* PSRAM OFF에서는 내부 힙을 즉시 반환해 BT 메모리 고갈을 방지 */
-            release_json_work_buffer_if_internal_heap();
         }
 
-        // 3단계: 버퍼 초기화 (MQTT 전송 완료 후)
+        // 4단계: 버퍼 초기화 (JSON 생성 실패 케이스 정리)
         // 새로운 데이터가 들어와도 이전 사이클과 명확히 구분됨
-        int sent_data_count = device->data_count;
-
-        for (int i = 0; i < 250; i++) {
-            if (device->device_data[i] != NULL) {
-                free(device->device_data[i]);
-                device->device_data[i] = NULL;
-            }
+        if (!batch_reset && sent_data_count > 0) {
+            reset_device_batch_buffers(device);
         }
-        device->data_count = 0;
-        device->overflow_warned = false;
-
-        // 메타데이터 초기화
-        device->hr = 0;
-        device->spo2 = 0;
-        device->temp = 0.0f;
-        device->battery = 0;
-        device->gyro = 0;
-        device->has_start_time = false;
-        memset(device->start_time, 0, sizeof(device->start_time));
 
         ESP_LOGI(TAG, "[%s] 전송 완료 및 버퍼 초기화 (전송 데이터: %d개, 다음 수집 준비)",
                  mac_str, sent_data_count);
@@ -580,11 +464,10 @@ esp_err_t device_collector_remove_device(const uint8_t* mac_address) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    // 데이터 메모리 해제
-    for (int i = 0; i < device->data_count; i++) {
+    // 데이터 슬롯 초기화 (고정 슬롯 방식)
+    for (int i = 0; i < DEVICE_SAMPLE_MAX; i++) {
         if (device->device_data[i] != NULL) {
-            free(device->device_data[i]);
-            device->device_data[i] = NULL;
+            device->device_data[i][0] = '\0';
         }
     }
 
@@ -598,7 +481,9 @@ esp_err_t device_collector_remove_device(const uint8_t* mac_address) {
     device->is_active = false;
     device->data_count = 0;
     memset(device->mac_address, 0, 6);
-    memset(device->device_data, 0, sizeof(device->device_data));
+    for (int i = 0; i < DEVICE_SAMPLE_MAX; i++) {
+        device->device_data[i] = g_device_sample_slots[(int)(device - devices)][i];
+    }
 
     ESP_LOGI(TAG, "=========================");
 
