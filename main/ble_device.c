@@ -51,7 +51,7 @@ static bool is_connecting = false;
 static bool is_connected = false;
 static esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
 
-static esp_err_t gattc_open_with_fallback(esp_gatt_if_t gattc_if, const esp_bd_addr_t bda, esp_ble_addr_type_t primary_type)
+static esp_err_t gattc_open_with_fallback(esp_gatt_if_t gattc_if, esp_bd_addr_t bda, esp_ble_addr_type_t primary_type)
 {
     // 1) primary 타입 먼저 시도
     esp_err_t ret = esp_ble_gattc_open(gattc_if, bda, primary_type, true);
