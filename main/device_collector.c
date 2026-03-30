@@ -13,9 +13,9 @@ static char *g_json_work_buf = NULL;
 /* 250개 배치 JSON 고정 작업 버퍼 (동적 추정/가변 할당 제거) */
 #define JSON_FIXED_BUF_SIZE (36 * 1024)
 // 최대 디바이스 개수 (여러 nrf5340 연결 대비)
-#define MAX_DEVICES 10
+#define MAX_DEVICES 5
 #define DEVICE_SAMPLE_MAX 250
-#define DEVICE_SAMPLE_STR_MAX 96
+#define DEVICE_SAMPLE_STR_MAX 64
 
 static bool json_appendf(char *buf, size_t cap, size_t *off, const char *fmt, ...)
 {
@@ -82,10 +82,21 @@ static void reset_device_batch_buffers(device_collector_t *device)
     memset(device->start_time, 0, sizeof(device->start_time));
 }
 
+// 최대 디바이스 개수 (여러 nrf5340 연결 대비)
+#define MAX_DEVICES 10
+#define DEVICE_SAMPLE_MAX 250
+#define DEVICE_SAMPLE_STR_MAX 96
+
 // 디버깅용: 총 데이터 수신 카운터
 static int g_total_data_received = 0;
-/* 고정 슬롯: 동적 malloc/free 제거 */
-static char g_device_sample_slots[MAX_DEVICES][DEVICE_SAMPLE_MAX][DEVICE_SAMPLE_STR_MAX];
+/* 고정 슬롯 힙 풀: 런타임 1회 할당(반복 malloc/free 제거 + .bss 절감) */
+static char *g_sample_pool = NULL;
+
+static inline char *sample_slot_ptr(int dev_idx, int sample_idx)
+{
+    size_t index = ((size_t)dev_idx * DEVICE_SAMPLE_MAX + (size_t)sample_idx) * DEVICE_SAMPLE_STR_MAX;
+    return &g_sample_pool[index];
+}
 
 // 제어 문자 제거 함수 (\n, \r, \t 등 제거)
 static void remove_control_chars(char* str) {
@@ -122,13 +133,25 @@ esp_err_t device_collector_init(void) {
 
     // 모든 디바이스 초기화
     memset(devices, 0, sizeof(devices));
+
+    size_t pool_size = (size_t)MAX_DEVICES * DEVICE_SAMPLE_MAX * DEVICE_SAMPLE_STR_MAX;
+    if (g_sample_pool == NULL) {
+        g_sample_pool = (char *)heap_caps_malloc(pool_size, MALLOC_CAP_8BIT);
+        if (g_sample_pool == NULL) {
+            ESP_LOGE(TAG, "샘플 풀 할당 실패 (%u bytes)", (unsigned)pool_size);
+            return ESP_ERR_NO_MEM;
+        }
+        memset(g_sample_pool, 0, pool_size);
+    }
+
     for (int i = 0; i < MAX_DEVICES; i++) {
         devices[i].is_active = false;
         devices[i].data_count = 0;
         memset(devices[i].mac_address, 0, 6);
         for (int j = 0; j < DEVICE_SAMPLE_MAX; j++) {
-            g_device_sample_slots[i][j][0] = '\0';
-            devices[i].device_data[j] = g_device_sample_slots[i][j];
+            char *slot = sample_slot_ptr(i, j);
+            slot[0] = '\0';
+            devices[i].device_data[j] = slot;
         }
     }
 
