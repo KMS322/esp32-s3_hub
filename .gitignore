@@ -21,6 +21,25 @@ __pycache__/
 *.log
 *.swp
 *~
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.lzma
+*.tar.lz
+*.tar.lzo
+*.tar.lz4
+*esp-idf*
+*esp-idf-v5.2.2*
+*esp-idf-v5.2.2-linux-x86_64*
+*esp-idf-v5.2.2-linux-x86_64.tar.gz*
+*esp-idf-v5.2.2-linux-x86_64.tar.bz2*
+*esp-idf-v5.2.2-linux-x86_64.tar.xz*
+*esp-idf-v5.2.2-linux-x86_64.tar.lzma*
+*esp-idf-v5.2.2-linux-x86_64.tar.lz*
+*esp-idf-v5.2.2-linux-x86_64.tar.lzo*
+*esp-idf-v5.2.2-linux-x86_64.tar.lz4*
 
 # 로컬만 쓰는 파일 (필요 시 추가)
 # .env

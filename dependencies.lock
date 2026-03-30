@@ -1,4 +1,21 @@
 dependencies:
+  espressif/cjson:
+    component_hash: 002c6d1872ee4c97d333938ebe107a29841cc847f9de89e676714bd2844057ea
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~1
+  espressif/json_generator:
+    component_hash: 6538d6acb33976977224343105498c06bcee459f932450a827176f992cdd24e8
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.0
   espressif/led_strip:
     component_hash: 28c6509a727ef74925b372ed404772aeedf11cce10b78c3f69b3c66799095e2d
     dependencies:
@@ -12,9 +29,12 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.1.6
+    version: 6.1.0
 direct_dependencies:
+- espressif/cjson
+- espressif/json_generator
 - espressif/led_strip
-manifest_hash: 08e0dee6eca83e7d8d73c22998d68a19eb9f0d1566cff539c1124b10b36f26e6
+- idf
+manifest_hash: f9a8694cb9d8cc3e3b0164b003cd51ad47cef248848c57eae3ec53f8cec38aa3
 target: esp32s3
-version: 2.0.0
+version: 3.0.0

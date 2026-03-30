@@ -3,8 +3,6 @@
 #include "esp_http_server.h"
 #include "string.h"
 #include "wifi_manager.h"
-#include "mbedtls/sha1.h"
-#include "mbedtls/base64.h"
 
 static const char *TAG = "WEB_SOCKET";
 
@@ -48,24 +46,6 @@ static void remove_client_fd(int fd) {
         if (client_count > 0) client_count--;
         ESP_LOGI(TAG, "클라이언트 제거 fd=%d (총 %d)", fd, client_count);
     }
-}
-
-// WebSocket Accept 키 생성
-static void generate_websocket_accept_key(const char* client_key, char* accept_key) {
-    const char* websocket_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    char combined[128];
-    
-    // 클라이언트 키 + 매직 문자열 결합
-    snprintf(combined, sizeof(combined), "%s%s", client_key, websocket_magic);
-    
-    // SHA1 해시 계산
-    unsigned char hash[20];
-    mbedtls_sha1((unsigned char*)combined, strlen(combined), hash);
-    
-    // Base64 인코딩
-    size_t output_len;
-    mbedtls_base64_encode((unsigned char*)accept_key, 64, &output_len, hash, 20);
-    accept_key[output_len] = '\0';
 }
 
 // WebSocket 핸들러 (간단한 HTTP 응답으로 WebSocket 연결 시뮬레이션)

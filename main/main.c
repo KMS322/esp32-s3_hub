@@ -142,9 +142,9 @@ void clean_string(char* str) {
 // MAC 주소 추출 함수
 static bool extract_mac_address(const char* mac_start, char* output, size_t output_size) {
     // 개행 문자 제거
-    char* newline = strchr(mac_start, '\n');
-    char* cr = strchr(mac_start, '\r');
-    char* end = mac_start + strlen(mac_start);
+    const char* newline = strchr(mac_start, '\n');
+    const char* cr = strchr(mac_start, '\r');
+    const char* end = mac_start + strlen(mac_start);
     if (newline != NULL && newline < end) end = newline;
     if (cr != NULL && cr < end) end = cr;
 

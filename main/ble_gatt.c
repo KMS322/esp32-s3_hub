@@ -4,6 +4,7 @@
 #include "wifi_manager.h"
 #include "http_client.h"
 #include "esp_log.h"
+#include "esp_log_buffer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "string.h"
@@ -16,6 +17,7 @@ static const char *TAG = "BLE_GATT";
 char test_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = "ESP32_S3";
 esp_gatt_if_t current_gatts_if = ESP_GATT_IF_NONE;
 uint16_t current_conn_id = 0;
+static esp_bd_addr_t current_remote_bda = {0};
 uint16_t local_mtu = 23;
 uint8_t char_value_read[CONFIG_EXAMPLE_CHAR_READ_DATA_LEN] = {0xDE,0xED,0xBE,0xEF};
 uint8_t char1_str[] = {0x11,0x22,0x33};
@@ -466,7 +468,7 @@ esp_err_t ble_disconnect(void) {
     
     // BLE 연결 끊기
     if (gl_profile_tab[PROFILE_A_APP_ID].conn_id != 0) {
-        ret = esp_ble_gap_disconnect(gl_profile_tab[PROFILE_A_APP_ID].conn_id);
+        ret = esp_ble_gap_disconnect(current_remote_bda);
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "BLE 연결 끊기 성공");
         } else {
@@ -661,7 +663,7 @@ void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare
 
 void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
     if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC){
-        esp_log_buffer_hex(TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len, ESP_LOG_INFO);
     }else{
         ESP_LOGI(TAG,"Prepare write cancel");
     }
@@ -1009,6 +1011,7 @@ void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gat
         current_conn_id = param->connect.conn_id;
         current_gatts_if = gatts_if;
         ble_connected = true;
+        memcpy(current_remote_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
 
         // ESP_LOGI(TAG, "Profile A 설정 완료 - conn_id: %d, gatts_if: %d", param->connect.conn_id, gatts_if);
 
@@ -1029,6 +1032,7 @@ void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gat
         current_conn_id = 0;
         current_gatts_if = ESP_GATT_IF_NONE;
         ble_connected = false;
+        memset(current_remote_bda, 0, sizeof(current_remote_bda));
         esp_ble_gap_start_advertising(&adv_params);
         local_mtu = 23;
         break;
@@ -1036,7 +1040,7 @@ void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gat
     case ESP_GATTS_CONF_EVT:
         ESP_LOGI(TAG, "Confirm receive, status %d, attr_handle %d", param->conf.status, param->conf.handle);
         if (param->conf.status != ESP_GATT_OK){
-            esp_log_buffer_hex(TAG, param->conf.value, param->conf.len);
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, param->conf.value, param->conf.len, ESP_LOG_INFO);
         }
         break;
 
