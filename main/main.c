@@ -217,6 +217,22 @@ static int hub_parse_connect_target_payload(const char *param, char out[][18], i
         while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) {
             *--end = '\0';
         }
+        /* 서버가 JSON처럼 ["aa:bb:..","cc:dd:.."]내면 토큰에 따옴표가 남음 — 제거 */
+        size_t tl = strlen(tok);
+        if (tl >= 2 && tok[0] == '"' && tok[tl - 1] == '"') {
+            tok[tl - 1] = '\0';
+            tok++;
+        } else if (tl >= 2 && tok[0] == '\'' && tok[tl - 1] == '\'') {
+            tok[tl - 1] = '\0';
+            tok++;
+        }
+        while (*tok == ' ' || *tok == '\t') {
+            tok++;
+        }
+        end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
         if (strlen(tok) == 0) {
             continue;
         }
@@ -470,9 +486,9 @@ void app_main(void)
     // delete_nvs(NVS_WIFI_PW);
     // delete_nvs(NVS_USER_EMAIL);
     // delete_nvs(NVS_MAC_ADDRESS);
-    // save_nvs(NVS_WIFI_ID, "iptime");
-    // save_nvs(NVS_WIFI_PW, "");
-    // save_nvs(NVS_USER_EMAIL, "c@c.com");
+    save_nvs(NVS_WIFI_ID, "iptime");
+    save_nvs(NVS_WIFI_PW, "");
+    save_nvs(NVS_USER_EMAIL, "c@c.com");
 
     // init_mac_address();
     // const char* local_mac_address = get_mac_address();
@@ -697,6 +713,10 @@ void app_main(void)
                                     esp_err_t wd = esp_wifi_disconnect();
                                     ESP_LOGI(GATTS_TAG, "delete: esp_wifi_disconnect -> %s", esp_err_to_name(wd));
                                 }
+                                (void)mqtt_deinit();
+                                mqtt_ready_sent = false;
+                                current_state = STATE_HUB_INIT;
+                                ESP_LOGI(GATTS_TAG, "delete: STATE_HUB_INIT으로 복귀 (부팅과 동일 분기)");
                             }
                         } else if(strcmp(cmd, "disconnect") == 0) {
                             if (extract_mac_address(colon_pos + 1, target_device_mac_address,

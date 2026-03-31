@@ -8,14 +8,19 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
-# PSRAM (N16R8: Octal 8MB, conservative 40MHz)
+# PSRAM (N16R8: Octal 8MB)
+# At 40MHz octal, IDF sets MSPI_TIMING_PSRAM_NEEDS_TUNING=(40>40)==0 and skips PSRAM MSPI tuning;
+# that can leave sampling marginal and crash right after esp_psram_impl_enable (StoreProhibited, bogus EXCVADDR).
+# 80MHz enables the PSRAM tuning path (octal DTR: needs_tuning = speed > 40).
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 # CONFIG_SPIRAM_MODE_QUAD is not set
 CONFIG_SPIRAM_TYPE_AUTO=y
-CONFIG_SPIRAM_SPEED_40M=y
-# CONFIG_SPIRAM_SPEED_80M is not set
+# CONFIG_SPIRAM_SPEED_40M is not set
+CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_BOOT_INIT=y
+# Stack in PSRAM before esp_psram_init completes can cause StoreProhibited boot loop on some S3 boards.
+# CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY is not set
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # Lower reserve -> larger contiguous internal blocks for BTU/bt_workqueue after controller init.
