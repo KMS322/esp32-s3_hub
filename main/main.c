@@ -5,6 +5,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -62,8 +63,12 @@ char* mac_address_from_nvs = NULL;
 // WiFi IP 주소
 char wifi_ip_address[16] = {0};
 
-// 디바이스 MAC 주소 저장 배열
+// 디바이스 MAC 주소 저장 배열 (반드시 sdkconfig CONFIG_BT_ACL_CONNECTIONS 와 동일할 것)
 #define MAX_DEVICE_COUNT 5
+#if defined(CONFIG_BT_ACL_CONNECTIONS)
+_Static_assert(CONFIG_BT_ACL_CONNECTIONS == MAX_DEVICE_COUNT,
+               "main.c MAX_DEVICE_COUNT must equal CONFIG_BT_ACL_CONNECTIONS");
+#endif
 char device_mac_addresses[MAX_DEVICE_COUNT][18] = {0};
 char registered_device_mac_addresses[MAX_DEVICE_COUNT][18] = {0};
 
@@ -158,6 +163,132 @@ static bool extract_mac_address(const char* mac_start, char* output, size_t outp
     return false;
 }
 
+/** connect_target:[aa:bb:.., cc:dd:..] 또는 connect_target: [ ... ] — 콤마로 MAC 목록 파싱 */
+static int hub_parse_connect_target_payload(const char *param, char out[][18], int max_out)
+{
+    if (!param || max_out <= 0) {
+        return 0;
+    }
+    const char *p = param;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    char work[256];
+    size_t len = strlen(p);
+    if (len == 0) {
+        return 0;
+    }
+    if (p[0] == '[') {
+        const char *close = strchr(p + 1, ']');
+        if (!close) {
+            ESP_LOGW(GATTS_TAG, "connect_target: ']' 없음");
+            return 0;
+        }
+        len = (size_t)(close - (p + 1));
+        if (len >= sizeof(work)) {
+            len = sizeof(work) - 1;
+        }
+        memcpy(work, p + 1, len);
+        work[len] = '\0';
+    } else {
+        if (len >= sizeof(work)) {
+            len = sizeof(work) - 1;
+        }
+        memcpy(work, p, len);
+        work[len] = '\0';
+    }
+    char *nl = strchr(work, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
+    char *cr = strchr(work, '\r');
+    if (cr) {
+        *cr = '\0';
+    }
+
+    int count = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(work, ",", &saveptr); tok != NULL && count < max_out;
+         tok = strtok_r(NULL, ",", &saveptr)) {
+        while (*tok == ' ' || *tok == '\t') {
+            tok++;
+        }
+        char *end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
+        if (strlen(tok) == 0) {
+            continue;
+        }
+        if (!ble_device_validate_mac_string(tok, out[count])) {
+            ESP_LOGW(GATTS_TAG, "connect_target: 잘못된 MAC 무시: %s", tok);
+        } else {
+            count++;
+        }
+    }
+    return count;
+}
+
+/** delete:[a,b] 또는 delete:[a,b,c] — 대괄호 안 비어 있지 않은 콤마 구분 토큰 개수 */
+static int hub_count_bracket_csv_tokens(const char *param)
+{
+    if (!param) {
+        return 0;
+    }
+    const char *p = param;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    char work[256];
+    size_t len = strlen(p);
+    if (len == 0) {
+        return 0;
+    }
+    if (p[0] == '[') {
+        const char *close = strchr(p + 1, ']');
+        if (!close) {
+            ESP_LOGW(GATTS_TAG, "delete: ']' 없음");
+            return 0;
+        }
+        len = (size_t)(close - (p + 1));
+        if (len >= sizeof(work)) {
+            len = sizeof(work) - 1;
+        }
+        memcpy(work, p + 1, len);
+        work[len] = '\0';
+    } else {
+        if (len >= sizeof(work)) {
+            len = sizeof(work) - 1;
+        }
+        memcpy(work, p, len);
+        work[len] = '\0';
+    }
+    char *nl = strchr(work, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
+    char *cr = strchr(work, '\r');
+    if (cr) {
+        *cr = '\0';
+    }
+
+    int count = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(work, ",", &saveptr); tok != NULL; tok = strtok_r(NULL, ",", &saveptr)) {
+        while (*tok == ' ' || *tok == '\t') {
+            tok++;
+        }
+        char *end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
+        if (strlen(tok) > 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
 uint8_t target_macs[][6] = {
     {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC},  // 첫 번째 MAC
     {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56}   // 두 번째 MAC
@@ -175,6 +306,149 @@ static esp_err_t hub_nvs_flash_init(void)
     return ret;
 }
 
+/** 브로커 연결(MQTT_EVENT_CONNECTED)은 비동기 — 폴링만 (mqtt_init은 한 번만 호출). */
+static bool hub_wait_mqtt_until_connected(uint32_t timeout_ms);
+
+/** BLE 스캔·연결은 수십 초 걸림 — 메인 루프에서 분리해 MQTT 명령 수신이 막히지 않게 함 */
+#define HUB_BLE_SCAN_TASK_STACK (10240)
+#define HUB_BLE_SCAN_TASK_PRIO   (4)
+static volatile bool s_hub_ble_scan_busy;
+
+static void hub_ble_scan_connect_task_fn(void *arg)
+{
+    (void)arg;
+    bool scan_report_mqtt_ok = false;
+
+    if (is_ble_initialized()) {
+        ESP_LOGI(GATTS_TAG, "[scan task] BLE 서버(GATTS) 완전 종료 중...");
+        ble_complete_deinit();
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+
+    hub_led_set_mode(HUB_LED_MODE_BLE_SCAN);
+
+    if (!ble_device_is_init_func()) {
+        esp_err_t ret = ble_device_init();
+        if (ret != ESP_OK) {
+            ESP_LOGE(GATTS_TAG, "[scan task] BLE 클라이언트 초기화 실패: %s", esp_err_to_name(ret));
+            hub_led_set_error(HUB_LED_ERR_BLE_SCAN);
+            goto task_done;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    int mac_count_param = 0;
+    for (int i = 0; i < MAX_DEVICE_COUNT; i++) {
+        if (strlen(device_mac_addresses[i]) > 0) {
+            mac_count_param++;
+        }
+    }
+
+    const char *scan_name = (mac_count_param > 0) ? NULL : "Tailing";
+    int scanned_count = ble_device_scan_multiple(scan_name, device_mac_addresses, mac_count_param);
+    if (scanned_count <= 0) {
+        ESP_LOGW(GATTS_TAG, "[scan task] 스캔 실패 또는 디바이스 없음");
+        hub_led_set_error(HUB_LED_ERR_BLE_SCAN);
+        goto task_done;
+    }
+
+    int connected_count = ble_device_connect_multiple();
+    if (connected_count <= 0) {
+        ESP_LOGW(GATTS_TAG, "[scan task] 다중 연결 실패(0개)");
+        hub_led_set_error(HUB_LED_ERR_BLE_CONNECT);
+        goto task_done;
+    }
+
+    char connected_macs[MAX_DEVICE_COUNT][18] = {0};
+    int n_macs = ble_device_get_connected_mac_addresses(connected_macs, MAX_DEVICE_COUNT);
+    if (n_macs <= 0) {
+        ESP_LOGW(GATTS_TAG, "[scan task] 연결 MAC 목록 비어 있음");
+        hub_led_set_error(HUB_LED_ERR_BLE_CONNECT);
+        goto task_done;
+    }
+
+    for (int i = 0; i < n_macs && i < MAX_DEVICE_COUNT; i++) {
+        strncpy(device_mac_addresses[i], connected_macs[i], 17);
+        device_mac_addresses[i][17] = '\0';
+        ESP_LOGI(GATTS_TAG, "[scan task] 연결된 디바이스 MAC[%d]: %s", i, device_mac_addresses[i]);
+    }
+
+    char json_buf[512];
+    int j = snprintf(json_buf, sizeof(json_buf), "{\"connected_devices\":[");
+    if (j < 0 || j >= (int)sizeof(json_buf)) {
+        hub_led_set_error(HUB_LED_ERR_MEMORY);
+        goto task_done;
+    }
+    size_t json_len = (size_t)j;
+    for (int i = 0; i < n_macs; i++) {
+        int w = snprintf(json_buf + json_len, sizeof(json_buf) - json_len, "%s\"%s\"",
+                         (i > 0) ? "," : "", connected_macs[i]);
+        if (w < 0 || (size_t)w >= sizeof(json_buf) - json_len) {
+            hub_led_set_error(HUB_LED_ERR_MEMORY);
+            goto task_done;
+        }
+        json_len += (size_t)w;
+    }
+    {
+        int w = snprintf(json_buf + json_len, sizeof(json_buf) - json_len, "]}");
+        if (w < 0 || (size_t)w >= sizeof(json_buf) - json_len) {
+            hub_led_set_error(HUB_LED_ERR_MEMORY);
+            goto task_done;
+        }
+    }
+
+    const char *mqtt_topic = mqtt_get_topic();
+    if (mqtt_topic == NULL) {
+        ESP_LOGE(GATTS_TAG, "[scan task] MQTT 토픽 없음");
+        hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
+        goto task_done;
+    }
+    if (!mqtt_is_connected()) {
+        ESP_LOGW(GATTS_TAG, "[scan task] MQTT 브로커 연결 대기…");
+        (void)hub_wait_mqtt_until_connected(30000);
+    }
+    if (!mqtt_is_connected()) {
+        ESP_LOGE(GATTS_TAG, "[scan task] MQTT 미연결");
+        hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
+        goto task_done;
+        }
+    if (mqtt_send_data(mqtt_topic, json_buf) == ESP_OK) {
+        ESP_LOGI(GATTS_TAG, "[scan task] MQTT 전송 성공");
+        scan_report_mqtt_ok = true;
+    } else {
+        ESP_LOGE(GATTS_TAG, "[scan task] MQTT 전송 실패");
+        hub_led_set_error(HUB_LED_ERR_MQTT_PUBLISH);
+    }
+
+    if (scan_report_mqtt_ok) {
+        hub_led_set_mode(HUB_LED_MODE_ONLINE);
+    }
+
+task_done:
+    s_hub_ble_scan_busy = false;
+    vTaskDelete(NULL);
+}
+
+static bool hub_wait_mqtt_until_connected(uint32_t timeout_ms)
+{
+    if (wifi_connected && !mqtt_is_initialized()) {
+        esp_err_t e = mqtt_init();
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(GATTS_TAG, "MQTT init: %s", esp_err_to_name(e));
+        }
+    }
+    const uint32_t step_ms = 100;
+    uint32_t elapsed = 0;
+    while (elapsed < timeout_ms) {
+        if (mqtt_is_connected()) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        elapsed += step_ms;
+    }
+    return mqtt_is_connected();
+}
+
 void app_main(void)
 {
     ESP_LOGI(GATTS_TAG, "=== 허브 시작 ===");
@@ -183,14 +457,22 @@ void app_main(void)
     hub_led_init(HUB_LED_DEFAULT_BRIGHTNESS);
     // 디바이스 수집기 초기화
     ESP_ERROR_CHECK(device_collector_init());
-    
+
+    /* Wi-Fi 스택이 malloc 실패 시 반복 출력하는 W wifi:m f null — 스캔만이 아니라
+     * 다중 연결·MQTT 구간에서도 도배되므로 부팅 시 한 번 경고 레벨을 끔(ERROR만 표시). */
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
+
+    /* BT 컨트롤러 선초기화(ble_controller_early_init)는 Wi-Fi+MQTT 이후 내부 DRAM이 바닥나
+     * Bluedroid HCI 호스트 기동(~수십 KB)에 실패하는 경우가 있어 비활성화함.
+     * 첫 BLE는 ble_device_init()에서 컨트롤러+Bluedroid를 한 번에 올림. RF 이슈 시에만 선초기화 재검토. */
+
     // delete_nvs(NVS_WIFI_ID);
     // delete_nvs(NVS_WIFI_PW);
     // delete_nvs(NVS_USER_EMAIL);
     // delete_nvs(NVS_MAC_ADDRESS);
-    // save_nvs(NVS_WIFI_ID, "kms");
-    // save_nvs(NVS_WIFI_PW, "12344321");
-    // save_nvs(NVS_USER_EMAIL, "n@n.com");
+    // save_nvs(NVS_WIFI_ID, "iptime");
+    // save_nvs(NVS_WIFI_PW, "");
+    // save_nvs(NVS_USER_EMAIL, "c@c.com");
 
     // init_mac_address();
     // const char* local_mac_address = get_mac_address();
@@ -300,6 +582,8 @@ void app_main(void)
                 break;
             
             case STATE_MQTT_DATA_RECEIVE:
+            {
+                const hub_state_t state_at_enter = current_state;
                 // MQTT 데이터 수신 대기
                 if (mqtt_data_received) {
                     // ESP_LOGI(GATTS_TAG, "MQTT 데이터 수신: %s", mqtt_received_data);
@@ -311,12 +595,42 @@ void app_main(void)
                         char cmd[64] = {0};
                         strncpy(cmd, mqtt_received_data, cmd_len < 63 ? cmd_len : 63);
                         
-                        if (strcmp(cmd, "connect") == 0) {
-                            ESP_LOGI(GATTS_TAG, "connect 명령 수신 - 디바이스 스캔 시작");
-                            // device_mac_addresses 배열 초기화
+                        if (strcmp(cmd, "connect_target") == 0) {
+                            ESP_LOGI(GATTS_TAG, "connect_target 수신 — 지정 MAC만 스캔·연결");
                             memset(device_mac_addresses, 0, sizeof(device_mac_addresses));
-                            // STATE_SCAN_DEVICES로 전환
-                            current_state = STATE_SCAN_DEVICES;
+                            int nmac = hub_parse_connect_target_payload(colon_pos + 1, device_mac_addresses, MAX_DEVICE_COUNT);
+                            if (nmac <= 0) {
+                                ESP_LOGW(GATTS_TAG, "connect_target: 유효한 MAC 없음");
+                            } else if (s_hub_ble_scan_busy) {
+                                ESP_LOGW(GATTS_TAG, "이미 스캔·연결 작업 진행 중 — connect_target 무시");
+                            } else {
+                                ESP_LOGI(GATTS_TAG, "connect_target: %d개 MAC", nmac);
+                                s_hub_ble_scan_busy = true;
+                                BaseType_t ok = xTaskCreate(hub_ble_scan_connect_task_fn, "ble_scan",
+                                                            HUB_BLE_SCAN_TASK_STACK, NULL,
+                                                            HUB_BLE_SCAN_TASK_PRIO, NULL);
+                                if (ok != pdPASS) {
+                                    s_hub_ble_scan_busy = false;
+                                    ESP_LOGE(GATTS_TAG, "ble_scan 태스크 생성 실패(메모리?)");
+                                    hub_led_set_error(HUB_LED_ERR_MEMORY);
+                                }
+                            }
+                        } else if (strcmp(cmd, "connect") == 0) {
+                            ESP_LOGI(GATTS_TAG, "connect 명령 수신 — 백그라운드에서 스캔·연결 시작 (MQTT 수신 유지)");
+                            memset(device_mac_addresses, 0, sizeof(device_mac_addresses));
+                            if (s_hub_ble_scan_busy) {
+                                ESP_LOGW(GATTS_TAG, "이미 스캔·연결 작업 진행 중 — 이번 connect 명령 무시");
+                            } else {
+                                s_hub_ble_scan_busy = true;
+                                BaseType_t ok = xTaskCreate(hub_ble_scan_connect_task_fn, "ble_scan",
+                                                            HUB_BLE_SCAN_TASK_STACK, NULL,
+                                                            HUB_BLE_SCAN_TASK_PRIO, NULL);
+                                if (ok != pdPASS) {
+                                    s_hub_ble_scan_busy = false;
+                                    ESP_LOGE(GATTS_TAG, "ble_scan 태스크 생성 실패(메모리?)");
+                                    hub_led_set_error(HUB_LED_ERR_MEMORY);
+                                }
+                            }
                         } else if (strcmp(cmd, "blink") == 0) {
                             if (extract_mac_address(colon_pos + 1, target_device_mac_address,
                                                    sizeof(target_device_mac_address))) {
@@ -340,6 +654,49 @@ void app_main(void)
                                 current_state = STATE_STOP_DEVICE;
                             } else {
                                 ESP_LOGE(GATTS_TAG, "stop 명령 MAC 주소 길이 오류");
+                            }
+                        } else if (strcmp(cmd, "delete") == 0) {
+                            /* delete:[wifiID, wifiPW] -> NVS_WIFI_ID/PW만 삭제
+                             * delete:[wifiID, wifiPW, Email] -> 위 + NVS_USER_EMAIL 삭제 (토큰 내용은 검증하지 않음) */
+                            int ntok = hub_count_bracket_csv_tokens(colon_pos + 1);
+                            if (ntok == 2) {
+                                (void)delete_nvs(NVS_WIFI_ID);
+                                (void)delete_nvs(NVS_WIFI_PW);
+                                if (wifi_id_from_nvs != NULL) {
+                                    free(wifi_id_from_nvs);
+                                    wifi_id_from_nvs = NULL;
+                                }
+                                if (wifi_pw_from_nvs != NULL) {
+                                    free(wifi_pw_from_nvs);
+                                    wifi_pw_from_nvs = NULL;
+                                }
+                                ESP_LOGI(GATTS_TAG, "delete: NVS WiFi ID/PW 삭제 완료 (2필드)");
+                            } else if (ntok >= 3) {
+                                (void)delete_nvs(NVS_WIFI_ID);
+                                (void)delete_nvs(NVS_WIFI_PW);
+                                (void)delete_nvs(NVS_USER_EMAIL);
+                                if (wifi_id_from_nvs != NULL) {
+                                    free(wifi_id_from_nvs);
+                                    wifi_id_from_nvs = NULL;
+                                }
+                                if (wifi_pw_from_nvs != NULL) {
+                                    free(wifi_pw_from_nvs);
+                                    wifi_pw_from_nvs = NULL;
+                                }
+                                if (user_email_from_nvs != NULL) {
+                                    free(user_email_from_nvs);
+                                    user_email_from_nvs = NULL;
+                                }
+                                ESP_LOGI(GATTS_TAG, "delete: NVS WiFi ID/PW/UserEmail 삭제 완료 (%d필드)", ntok);
+                            } else {
+                                ESP_LOGW(GATTS_TAG, "delete: 비어 있지 않은 토큰이 2개 또는 3개 이상이어야 함 (현재 %d)", ntok);
+                            }
+                            if (ntok == 2 || ntok >= 3) {
+                                memset(wifi_ip_address, 0, sizeof(wifi_ip_address));
+                                if (is_wifi_initialized()) {
+                                    esp_err_t wd = esp_wifi_disconnect();
+                                    ESP_LOGI(GATTS_TAG, "delete: esp_wifi_disconnect -> %s", esp_err_to_name(wd));
+                                }
                             }
                         } else if(strcmp(cmd, "disconnect") == 0) {
                             if (extract_mac_address(colon_pos + 1, target_device_mac_address,
@@ -372,39 +729,59 @@ void app_main(void)
                                     device_mac_addresses[i][17] = '\0';
                                 }
 
-                                // JSON 생성: device:["aa:bb:cc:dd:ee","bb:cc:dd:ee:ff"]
-                                cJSON *json_array = cJSON_CreateArray();
-                                for (int i = 0; i < connected_count; i++) {
-                                    cJSON_AddItemToArray(json_array, cJSON_CreateString(device_mac_addresses[i]));
-                                }
-
-                                char *json_string = cJSON_Print(json_array);
-                                if (json_string != NULL) {
-                                    // "device:" 접두사 추가
-                                    char response[512];
-                                    snprintf(response, sizeof(response), "device:%s", json_string);
-
-                                    ESP_LOGI(GATTS_TAG, "MQTT 전송: %s", response);
-
-                                    // MQTT로 전송
-                                    const char* mqtt_topic = mqtt_get_topic();
-                                    if (mqtt_topic != NULL && mqtt_is_connected()) {
-                                        esp_err_t mqtt_ret = mqtt_send_data(mqtt_topic, response);
-                                        if (mqtt_ret == ESP_OK) {
-                                            ESP_LOGI(GATTS_TAG, "state 응답 전송 성공");
-                                        } else {
-                                            ESP_LOGE(GATTS_TAG, "state 응답 전송 실패");
-                                            hub_led_set_error(HUB_LED_ERR_MQTT_PUBLISH);
-                                        }
-                                    } else {
-                                        hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
-                                    }
-
-                                    free(json_string);
-                                } else {
+                                /* cJSON_Print 대신 스택 버퍼 — 힙 파편화/실패 방지 */
+                                char inner[400];
+                                int n = snprintf(inner, sizeof(inner), "[");
+                                if (n < 0 || n >= (int)sizeof(inner)) {
                                     hub_led_set_error(HUB_LED_ERR_MEMORY);
+                                } else {
+                                    size_t ilen = (size_t)n;
+                                    for (int i = 0; i < connected_count; i++) {
+                                        int w = snprintf(inner + ilen, sizeof(inner) - ilen,
+                                                           "%s\"%s\"",
+                                                           (i > 0) ? "," : "",
+                                                           device_mac_addresses[i]);
+                                        if (w < 0 || (size_t)w >= sizeof(inner) - ilen) {
+                                            ilen = sizeof(inner);
+                                            break;
+                                        }
+                                        ilen += (size_t)w;
+                                    }
+                                    if (ilen < sizeof(inner)) {
+                                        int w = snprintf(inner + ilen, sizeof(inner) - ilen, "]");
+                                        if (w < 0 || (size_t)w >= sizeof(inner) - ilen) {
+                                            ilen = sizeof(inner);
+                                        }
+                                    }
+                                    char response[512];
+                                    if (ilen >= sizeof(inner)) {
+                                        hub_led_set_error(HUB_LED_ERR_MEMORY);
+                                    } else if (snprintf(response, sizeof(response), "device:%s", inner)
+                                               >= (int)sizeof(response)) {
+                                        hub_led_set_error(HUB_LED_ERR_MEMORY);
+                                    } else {
+                                        ESP_LOGI(GATTS_TAG, "MQTT 전송: %s", response);
+                                        const char* mqtt_topic = mqtt_get_topic();
+                                        if (mqtt_topic != NULL) {
+                                            if (!mqtt_is_connected()) {
+                                                (void)hub_wait_mqtt_until_connected(30000);
+                                            }
+                                            if (mqtt_is_connected()) {
+                                                esp_err_t mqtt_ret = mqtt_send_data(mqtt_topic, response);
+                                                if (mqtt_ret == ESP_OK) {
+                                                    ESP_LOGI(GATTS_TAG, "state 응답 전송 성공");
+                                                } else {
+                                                    ESP_LOGE(GATTS_TAG, "state 응답 전송 실패");
+                                                    hub_led_set_error(HUB_LED_ERR_MQTT_PUBLISH);
+                                                }
+                                            } else {
+                                                hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
+                                            }
+                                        } else {
+                                            hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
+                                        }
+                                    }
                                 }
-                                cJSON_Delete(json_array);
                             }
                         }
                     }
@@ -413,8 +790,14 @@ void app_main(void)
                     mqtt_data_received = false;
                     memset(mqtt_received_data, 0, sizeof(mqtt_received_data));
                 }
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                /* 스캔은 별도 태스크 처리 — 유휴 시 MQTT 명령 폴링을 100ms로 단축 */
+                if (current_state != state_at_enter) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
                 break;
+            }
             
             case STATE_BLINK_DEVICE:
                 ESP_LOGI(GATTS_TAG, "###### STATE_BLINK_DEVICE 진입 ######");
@@ -437,8 +820,8 @@ void app_main(void)
                     ESP_LOGW(GATTS_TAG, "타겟 디바이스 MAC 주소가 비어있습니다");
                 }
 
-                // MQTT_DATA_RECEIVE 상태로 복귀
                 current_state = STATE_MQTT_DATA_RECEIVE;
+                ESP_LOGI(GATTS_TAG, "STATE_MQTT_DATA_RECEIVE로 복귀 (다음 MQTT 명령 대기)");
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;
             
@@ -464,6 +847,7 @@ void app_main(void)
                 }
 
                 current_state = STATE_MQTT_DATA_RECEIVE;
+                ESP_LOGI(GATTS_TAG, "STATE_MQTT_DATA_RECEIVE로 복귀 (다음 MQTT 명령 대기)");
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;
 
@@ -489,6 +873,7 @@ void app_main(void)
                 }
             
                 current_state = STATE_MQTT_DATA_RECEIVE;
+                ESP_LOGI(GATTS_TAG, "STATE_MQTT_DATA_RECEIVE로 복귀 (다음 MQTT 명령 대기)");
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;
 
@@ -515,6 +900,7 @@ void app_main(void)
                 }
 
                 current_state = STATE_MQTT_DATA_RECEIVE;
+                ESP_LOGI(GATTS_TAG, "STATE_MQTT_DATA_RECEIVE로 복귀 (다음 MQTT 명령 대기)");
                 vTaskDelay(pdMS_TO_TICKS(10));
                 break;    
   
@@ -937,115 +1323,11 @@ void app_main(void)
                 vTaskDelay(pdMS_TO_TICKS(50));
                 break;
                 
-            case STATE_SCAN_DEVICES :
-                ESP_LOGI(GATTS_TAG, "###### STATE_SCAN_DEVICES 진입 ######");
-
-                // BLE 서버가 실행 중이면 완전 종료
-                if (is_ble_initialized()) {
-                    ESP_LOGI(GATTS_TAG, "BLE 서버 완전 종료 중...");
-                    ble_complete_deinit();
-                    ESP_LOGI(GATTS_TAG, "BLE 스택 완전 해제 대기 중...");
-                    vTaskDelay(pdMS_TO_TICKS(3000)); // 3초 대기로 증가 - BT 스택 완전 해제
-                }
-
-                hub_led_set_mode(HUB_LED_MODE_BLE_SCAN);
-
-                // BLE 클라이언트 초기화 상태 확인
-                ESP_LOGI(GATTS_TAG, "BLE 클라이언트 초기화 상태: %s", ble_device_is_init_func() ? "초기화됨" : "미초기화");
-
-                if(!ble_device_is_init_func()) {
-                    ESP_LOGI(GATTS_TAG, "BLE 클라이언트 초기화 시작...");
-                    esp_err_t ret = ble_device_init();
-                    if (ret != ESP_OK) {
-                        ESP_LOGE(GATTS_TAG, "BLE 클라이언트 초기화 실패: %s", esp_err_to_name(ret));
-                        hub_led_set_error(HUB_LED_ERR_BLE_SCAN);
-                        vTaskDelay(pdMS_TO_TICKS(5000));
-                        break;
-                    }
-                    // ESP_LOGI(GATTS_TAG, "BLE 클라이언트 초기화 완료");
-                    vTaskDelay(pdMS_TO_TICKS(1000)); // 초기화 후 안정화 대기
-                }
-                // 다중 스캔 및 연결
-                // device_mac_addresses 배열의 실제 개수 계산
-                int mac_count = 0;
-                for (int i = 0; i < MAX_DEVICE_COUNT; i++) {
-                    if (strlen(device_mac_addresses[i]) > 0) {
-                        mac_count++;
-                    }
-                }
-
-                int scanned_count = ble_device_scan_multiple("Tailing", device_mac_addresses, mac_count);
-                if (scanned_count > 0) {
-                    ESP_LOGI(GATTS_TAG, "스캔 완료: %d개 디바이스 발견", scanned_count);
-                    
-                    // 모든 디바이스에 연결 시도
-                    int connected_count = ble_device_connect_multiple();
-                    if (connected_count > 0) {
-                        ESP_LOGI(GATTS_TAG, "다중 연결 성공: %d개 디바이스 연결됨", connected_count);
-                        bool scan_report_mqtt_ok = false;
-
-                        // 연결된 디바이스들의 MAC 주소를 배열에 저장
-                        char connected_macs[MAX_DEVICE_COUNT][18] = {0};
-                        int mac_count = ble_device_get_connected_mac_addresses(connected_macs, MAX_DEVICE_COUNT);
-                        
-                        if (mac_count > 0) {
-                            // device_mac_addresses 배열에 저장
-                            for (int i = 0; i < mac_count && i < MAX_DEVICE_COUNT; i++) {
-                                strncpy(device_mac_addresses[i], connected_macs[i], 17);
-                                device_mac_addresses[i][17] = '\0';
-                                ESP_LOGI(GATTS_TAG, "연결된 디바이스 MAC[%d]: %s", i, device_mac_addresses[i]);
-                            }
-                            
-                            // JSON 생성: {"connected_devices": ["aa:bb:cc:dd:ee", ...]}
-                            cJSON *json = cJSON_CreateObject();
-                            cJSON *devices_array = cJSON_CreateArray();
-                            for (int i = 0; i < mac_count; i++) {
-                                cJSON_AddItemToArray(devices_array, cJSON_CreateString(device_mac_addresses[i]));
-                            }
-                            cJSON_AddItemToObject(json, "connected_devices", devices_array);
-                            
-                            char *json_string = cJSON_Print(json);
-                            if (json_string != NULL) {
-                                ESP_LOGI(GATTS_TAG, "MQTT 전송할 JSON: %s", json_string);
-                                
-                                // MQTT로 전송
-                                const char* mqtt_topic = mqtt_get_topic();
-                                if (mqtt_topic != NULL && mqtt_is_connected()) {
-                                    esp_err_t mqtt_ret = mqtt_send_data(mqtt_topic, json_string);
-                                    if (mqtt_ret == ESP_OK) {
-                                        ESP_LOGI(GATTS_TAG, "MQTT 전송 성공");
-                                        scan_report_mqtt_ok = true;
-                                    } else {
-                                        ESP_LOGE(GATTS_TAG, "MQTT 전송 실패: %s", esp_err_to_name(mqtt_ret));
-                                        hub_led_set_error(HUB_LED_ERR_MQTT_PUBLISH);
-                                    }
-                                } else {
-                                    ESP_LOGE(GATTS_TAG, "MQTT 연결되지 않음");
-                                    hub_led_set_error(HUB_LED_ERR_MQTT_CONNECT);
-                                }
-                                
-                                free(json_string);
-                            } else {
-                                hub_led_set_error(HUB_LED_ERR_MEMORY);
-                            }
-                            cJSON_Delete(json);
-                        }
-                        
-                        // 다음 상태로 전환: STATE_MQTT_DATA_RECEIVE로 복귀
-                        if (scan_report_mqtt_ok) {
-                            hub_led_set_mode(HUB_LED_MODE_ONLINE);
-                        }
-                        current_state = STATE_MQTT_DATA_RECEIVE;
-                    } else {
-                        ESP_LOGW(GATTS_TAG, "연결 실패 - 재시도");
-                        hub_led_set_error(HUB_LED_ERR_BLE_CONNECT);
-                    }
-                } else {
-                    ESP_LOGW(GATTS_TAG, "스캔 실패 또는 디바이스 없음 - 재시도");
-                    hub_led_set_error(HUB_LED_ERR_BLE_SCAN);
-                }
-
-                vTaskDelay(pdMS_TO_TICKS(500));
+            case STATE_SCAN_DEVICES:
+                /* 레거시: 스캔·연결은 hub_ble_scan_connect_task_fn에서 비동기 수행 */
+                ESP_LOGW(GATTS_TAG, "STATE_SCAN_DEVICES 직접 진입 — MQTT_DATA_RECEIVE로 복귀");
+                current_state = STATE_MQTT_DATA_RECEIVE;
+                vTaskDelay(pdMS_TO_TICKS(10));
                 break;
 
                    // ble로 데이터 받는 것을 대기중인 경우

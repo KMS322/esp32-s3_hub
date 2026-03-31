@@ -106,8 +106,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
         
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "MQTT 연결 해제");
+        ESP_LOGW(TAG, "MQTT 연결 해제 — Wi‑Fi 유지 시 재연결 시도");
         mqtt_connected = false;
+        if (wifi_connected && client != NULL) {
+            esp_err_t rc = esp_mqtt_client_reconnect(client);
+            if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "esp_mqtt_client_reconnect: %s", esp_err_to_name(rc));
+            }
+        }
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -260,10 +266,13 @@ esp_err_t mqtt_init(void)
     snprintf(mqtt_broker_url, sizeof(mqtt_broker_url), "mqtt://%s:%d", host_start, MQTT_BROKER_PORT);
     ESP_LOGI(TAG, "MQTT 브로커 URL: %s", mqtt_broker_url);
 
-    // MQTT 클라이언트 설정
+    // MQTT 클라이언트 설정 (keepalive·타임아웃: BLE 부하 시 PING 지연으로 끊김 완화)
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = mqtt_broker_url,
         .credentials.client_id = mqtt_client_id,  // 동적으로 생성된 클라이언트 ID 사용
+        .session.keepalive = 300,
+        .network.timeout_ms = 20000,
+        .network.disable_auto_reconnect = false,
     };
 
     // 사용자 이름과 비밀번호가 설정되어 있다면 추가

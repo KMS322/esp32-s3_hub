@@ -9,6 +9,7 @@
 #include "lwip/sockets.h"
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "HTTP_CLIENT";
 
@@ -140,6 +141,11 @@ char* send_http_post(const char* path, const char* data)
     char full_url[256];
     snprintf(full_url, sizeof(full_url), "%s%s", HTTP_SERVER_URL, path);
     
+    /* HTTPS TLS는 내부 RAM에 큰 버퍼를 씀 — 힙 부족 시 mbedtls_ssl_setup -0x7F00 (ALLOC_FAILED) */
+    ESP_LOGI(TAG, "heap 내부RAM: %u, 최소: %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
     // HTTP 클라이언트 설정 (HTTPS 지원)
     esp_http_client_config_t config = {
         .url = full_url,
@@ -148,6 +154,8 @@ char* send_http_post(const char* path, const char* data)
         .event_handler = http_event_handler,
         .transport_type = HTTP_TRANSPORT_UNKNOWN,  // HTTP/HTTPS 자동 감지
         .crt_bundle_attach = esp_crt_bundle_attach,  // ESP32 기본 CA 인증서 번들 사용
+        .buffer_size = 1024,
+        .buffer_size_tx = 1024,
     };
     
     // HTTP 클라이언트 초기화

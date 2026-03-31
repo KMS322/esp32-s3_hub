@@ -1,3 +1,3 @@
 idf_component_register(SRCS "hub_led.c" "usb.c" "mqtt.c" "device_collector.c" "ble_device.c" "gpio_control.c" "ble_client.c" "nvs_manager.c" "main.c" "http_client.c" "ble_gatt.c" "wifi_manager.c" "web_socket.c"
                     INCLUDE_DIRS "."
-                    REQUIRES "esp_http_client" "nvs_flash" "esp_wifi" "esp_netif" "esp_event" "bt" "mbedtls" "esp_http_server" "freertos" "esp_common" "esp_timer" "led_strip" "mqtt" "esp_driver_gpio" "esp_driver_usb_serial_jtag" "cjson")
+                    REQUIRES "esp_http_client" "nvs_flash" "esp_wifi" "esp_netif" "esp_event" "esp_coex" "bt" "mbedtls" "esp_http_server" "freertos" "esp_common" "esp_timer" "heap" "led_strip" "mqtt" "driver" "cjson")

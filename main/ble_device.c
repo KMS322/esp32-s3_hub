@@ -1,18 +1,164 @@
 #include "ble_device.h"
 #include "device_collector.h"
+#include "mqtt.h"
 #include "gpio_control.h"
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
+#include "esp_wifi.h"
+#include "esp_coexist.h"
 #include "esp_gap_ble_api.h"
 #include "esp_gattc_api.h"
+#include "esp_heap_caps.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "string.h"
 #include <ctype.h>
 #include <inttypes.h>
+#include <stdio.h>
 
 static const char *TAG = "BLE_DEVICE";
+
+static bool s_bt_controller_early_ready = false;
+
+esp_err_t ble_controller_early_init(void)
+{
+    if (s_bt_controller_early_ready) {
+        return ESP_OK;
+    }
+    esp_bt_controller_status_t st = esp_bt_controller_get_status();
+    if (st == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        s_bt_controller_early_ready = true;
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "BT 컨트롤러 선초기화 (Wi-Fi 시작 전 RF)");
+    esp_log_level_set("BLE_INIT", ESP_LOG_NONE);
+    (void)esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "선초기화 controller_init: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "선초기화 controller_enable: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    s_bt_controller_early_ready = true;
+    ESP_LOGI(TAG, "BT 컨트롤러 선초기화 완료");
+    return ESP_OK;
+}
+
+/** Bluedroid만 내려짐/부분 실패 시 호출 (컨트롤러는 그대로 둘 수 있음) */
+static void ble_device_bluedroid_safe_teardown(void)
+{
+    esp_bluedroid_status_t st = esp_bluedroid_get_status();
+    if (st == ESP_BLUEDROID_STATUS_ENABLED) {
+        esp_err_t r = esp_bluedroid_disable();
+        if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "bluedroid_disable: %s", esp_err_to_name(r));
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    st = esp_bluedroid_get_status();
+    if (st != ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+        esp_err_t r = esp_bluedroid_deinit();
+        if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "bluedroid_deinit: %s", esp_err_to_name(r));
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+/**
+ * 컨트롤러만 켜 둔 채로 Bluedroid enable 시 HCI Start Failure가 나는 경우:
+ * 컨트롤러 disable→deinit 후 전체 재기동으로 VHCI/HCI를 맞춤.
+ */
+static esp_err_t ble_device_full_stack_rebuild_from_idle(void)
+{
+    ESP_LOGW(TAG, "BT 컨트롤러 풀 재구성 (disable→deinit→init→enable)");
+
+    esp_bt_controller_status_t cst = esp_bt_controller_get_status();
+    if (cst == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        esp_err_t r = esp_bt_controller_disable();
+        if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "controller_disable: %s", esp_err_to_name(r));
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    cst = esp_bt_controller_get_status();
+    if (cst != ESP_BT_CONTROLLER_STATUS_IDLE) {
+        esp_err_t r = esp_bt_controller_deinit();
+        if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "controller_deinit: %s", esp_err_to_name(r));
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    s_bt_controller_early_ready = false;
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t mr = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    if (mr != ESP_OK && mr != ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "mem_release: %s", esp_err_to_name(mr));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "controller_init: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "controller_enable: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    s_bt_controller_early_ready = true;
+    return ESP_OK;
+}
+
+/** Bluedroid 올리기 전 실패 시 컨트롤러만 남는 상태 방지(내부 힙 ~수십 KB 반환) */
+static void ble_device_bt_controller_teardown(void)
+{
+    esp_bt_controller_status_t cst = esp_bt_controller_get_status();
+    if (cst == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        esp_err_t r = esp_bt_controller_disable();
+        if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "controller_disable: %s", esp_err_to_name(r));
+        }
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    cst = esp_bt_controller_get_status();
+    if (cst != ESP_BT_CONTROLLER_STATUS_IDLE) {
+        esp_err_t r = esp_bt_controller_deinit();
+        if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "controller_deinit: %s", esp_err_to_name(r));
+        }
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    s_bt_controller_early_ready = false;
+}
+
+/** Wi-Fi + BLE 동시 사용 시 RF/공존(emi) 단계에서 멈춤·WDT 방지: PS 끄고 BT 우선, 짧게 양보 */
+static void ble_device_prepare_wifi_bt_coex(void)
+{
+    esp_err_t psr = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (psr != ESP_OK && psr != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGD(TAG, "esp_wifi_set_ps: %s", esp_err_to_name(psr));
+    }
+    esp_err_t err = esp_coex_preference_set(ESP_COEX_PREFER_BT);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_coex_preference_set(BT) 실패(무시 가능): %s", esp_err_to_name(err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
 
 // BLE 초기화 상태
 static bool ble_device_is_init = false;
@@ -237,6 +383,21 @@ static bool parse_mac_address(const char* mac_str, uint8_t* mac_bytes) {
         }
     }
     
+    return true;
+}
+
+bool ble_device_validate_mac_string(const char *mac_str, char out18[18])
+{
+    if (out18 == NULL) {
+        return false;
+    }
+    uint8_t mac_bytes[6];
+    if (!parse_mac_address(mac_str, mac_bytes)) {
+        return false;
+    }
+    snprintf(out18, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac_bytes[0], mac_bytes[1], mac_bytes[2],
+             mac_bytes[3], mac_bytes[4], mac_bytes[5]);
     return true;
 }
 
@@ -472,10 +633,28 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
         case ESP_GATTC_DISCONNECT_EVT:
             {
                 uint16_t conn_id = param->disconnect.conn_id;
-                ESP_LOGI(TAG, "디바이스 연결 해제됨 - conn_id: %d", conn_id);
-                
-                // 연결 컨텍스트 찾기
-                device_connection_t* conn = find_connection_by_conn_id(conn_id);
+                ESP_LOGI(TAG, "디바이스 연결 해제됨 - conn_id: %d, reason=%d", conn_id,
+                         (int)param->disconnect.reason);
+
+                device_connection_t *conn = find_connection_by_conn_id(conn_id);
+                const uint8_t *bda_for_notify = conn ? conn->remote_bda : param->disconnect.remote_bda;
+                char disc_mac[18] = {0};
+                device_collector_mac_to_string(bda_for_notify, disc_mac);
+                char disc_payload[40];
+                snprintf(disc_payload, sizeof(disc_payload), "lost_signal:%s", disc_mac);
+                const char *pub_topic = mqtt_get_topic();
+                if (pub_topic != NULL && mqtt_is_connected()) {
+                    esp_err_t pr = mqtt_send_data(pub_topic, disc_payload);
+                    if (pr == ESP_OK) {
+                        ESP_LOGI(TAG, "MQTT lost_signal 알림 전송: %s", disc_payload);
+                    } else {
+                        ESP_LOGW(TAG, "MQTT lost_signal 알림 실패: %s (%s)", disc_payload, esp_err_to_name(pr));
+                    }
+                } else {
+                    ESP_LOGW(TAG, "MQTT 미연결 — lost_signal 알림 생략: %s", disc_payload);
+                }
+
+                // 연결 컨텍스트 (위에서 conn 조회 완료)
                 if (conn != NULL) {
                     // 디바이스 수집기에서 객체 제거
                     esp_err_t remove_ret = device_collector_remove_device(conn->remote_bda);
@@ -649,8 +828,12 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                     // 이름 일치 AND MAC 주소 일치 (단일 MAC 또는 필터 없음)
                     bool device_match = false;
                     if (target_mac_list_count > 0) {
-                        // MAC 배열이 있으면: 이름 일치 OR MAC 배열 중 하나 일치
-                        device_match = (name_match || mac_match);
+                        /* 이름이 비어 있으면 MAC 목록만 사용(connect_target 전용). 이름이 있으면 Tailing|MAC OR */
+                        if (strlen(target_device_name) > 0) {
+                            device_match = (name_match || mac_match);
+                        } else {
+                            device_match = mac_match;
+                        }
                     } else {
                         // MAC 배열 없으면: 이름 일치 AND (MAC 일치 또는 MAC 필터 없음)
                         device_match = (name_match && mac_match);
@@ -760,35 +943,114 @@ esp_err_t ble_device_init(void) {
     active_connections = 0;
     scanned_device_count = 0;
     memset(scanned_devices, 0, sizeof(scanned_devices));
-    
-    // BT 컨트롤러 초기화 (IDF BLE_INIT 배너 로그 비표시)
+
+    ble_device_prepare_wifi_bt_coex();
+
+    {
+        size_t free_i = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGI(TAG, "BT 전 내부 DRAM: free=%zu, largest_block=%zu", free_i, largest);
+    }
+
     esp_log_level_set("BLE_INIT", ESP_LOG_NONE);
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "BT 컨트롤러 초기화 실패: %s", esp_err_to_name(ret));
-        return ret;
+
+    esp_bt_controller_status_t cst = esp_bt_controller_get_status();
+    esp_err_t ret;
+
+    if (cst == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        {
+            esp_err_t mr = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+            if (mr != ESP_OK && mr != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "esp_bt_controller_mem_release(CLASSIC_BT): %s", esp_err_to_name(mr));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        ret = esp_bt_controller_init(&bt_cfg);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "BT 컨트롤러 초기화 실패: %s", esp_err_to_name(ret));
+            ble_device_bt_controller_teardown();
+            return ret;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "BT 컨트롤러 활성화 실패: %s", esp_err_to_name(ret));
+            ble_device_bt_controller_teardown();
+            return ret;
+        }
+    } else if (cst == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        /* ble_complete_deinit()가 컨트롤러는 유지 — RF(r_rf_rw_v9_le_init) 재진입 없이 Bluedroid만 재기동 */
+        ESP_LOGI(TAG, "BT 컨트롤러 이미 활성 — init/enable 생략");
+    } else if (cst == ESP_BT_CONTROLLER_STATUS_INITED) {
+        ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "BT 컨트롤러 활성화 실패: %s", esp_err_to_name(ret));
+            return ret;
+        }
+    } else {
+        ESP_LOGE(TAG, "BT 컨트롤러 상태 비정상: %d", (int)cst);
+        return ESP_ERR_INVALID_STATE;
     }
-    
-    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "BT 컨트롤러 활성화 실패: %s", esp_err_to_name(ret));
-        return ret;
+
+    /* 공존/PS 변경 직후 너무 빨리 Bluedroid를 올리면 hci_start_up() 실패 가능 */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    {
+        const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        /* 18432에서 bt_workqueue 할당 실패(패닉). MQTT만 내려도 컨트롤러 이후 largest≈21KB —
+         * 24576 고정은 과도해 NO_MEM만 반복. 20KB 이상이면 Bluedroid 시도(여전히 부족하면 IDF가 실패). */
+        const size_t k_abort_free = 20000;
+        const size_t k_abort_largest = 20480;
+        ESP_LOGI(TAG, "컨트롤러 이후 내부 DRAM: free=%zu, largest_block=%zu (Bluedroid 최소 largest>=%zu free>=%zu)",
+                 internal_free, largest, k_abort_largest, k_abort_free);
+        if (internal_free < k_abort_free || largest < k_abort_largest) {
+            ESP_LOGE(TAG, "Bluedroid 기동 불가: 연속 블록 부족(largest=%zu, free=%zu). "
+                     "Wi‑Fi 일시 정지·MQTT 정지 후 재시도. BT 컨트롤러 내림.",
+                     largest, internal_free);
+            ble_device_bt_controller_teardown();
+            return ESP_ERR_NO_MEM;
+        }
     }
-    
-    // Bluedroid 초기화
-    ret = esp_bluedroid_init();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "Bluedroid 초기화 실패: %s", esp_err_to_name(ret));
-        return ret;
+
+    bool bluedroid_ok = false;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "Bluedroid 기동 재시도 — 풀 BT 스택 재구성");
+            ble_device_bluedroid_safe_teardown();
+            ret = ble_device_full_stack_rebuild_from_idle();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "풀 스택 재구성 실패: %s", esp_err_to_name(ret));
+                return ret;
+            }
+            ble_device_prepare_wifi_bt_coex();
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+        ret = esp_bluedroid_init();
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Bluedroid 초기화 실패: %s", esp_err_to_name(ret));
+            if (attempt == 1) {
+                return ret;
+            }
+            continue;
+        }
+        ret = esp_bluedroid_enable();
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Bluedroid 활성화 실패: %s", esp_err_to_name(ret));
+            if (attempt == 1) {
+                return ret;
+            }
+            continue;
+        }
+        bluedroid_ok = true;
+        break;
     }
-    
-    ret = esp_bluedroid_enable();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "Bluedroid 활성화 실패: %s", esp_err_to_name(ret));
-        return ret;
+    if (!bluedroid_ok) {
+        return ESP_FAIL;
     }
-    
+
     // GATT 클라이언트 콜백 등록
     ret = esp_ble_gattc_register_callback(gattc_event_handler);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
@@ -879,23 +1141,23 @@ bool ble_device_scan(const char* device_name, const char* mac_address) {
     // 스캔 시작
     is_scanning = true;
     ESP_LOGI(TAG, "=== BLE 스캔 시작 (최대 10초) ===");
-    
+
     ret = esp_ble_gap_start_scanning(10); // 10초 스캔
     if (ret != ESP_OK) {
         is_scanning = false;
         ESP_LOGE(TAG, "스캔 시작 실패: %s", esp_err_to_name(ret));
         return false;
     }
-    
+
     // 스캔 완료 대기 (최대 11초)
     int timeout = 11; // 10초 + 여유 1초
     while (is_scanning && timeout > 0) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         timeout--;
     }
-    
+
     is_scanning = false;
-    
+
     if (device_found) {
         ESP_LOGI(TAG, "=== 디바이스 발견 (스캔 성공) ===");
         
@@ -1042,23 +1304,23 @@ int ble_device_scan_multiple(const char* device_name, char mac_addresses[][18], 
     // 스캔 시작
     is_scanning = true;
     ESP_LOGI(TAG, "=== 다중 스캔 시작 (최대 10초, 모든 디바이스 수집) ===");
-    
+
     ret = esp_ble_gap_start_scanning(10); // 10초 스캔
     if (ret != ESP_OK) {
         is_scanning = false;
         ESP_LOGE(TAG, "스캔 시작 실패: %s", esp_err_to_name(ret));
         return 0;
     }
-    
+
     // 스캔 완료 대기 (최대 11초)
     int timeout = 11; // 10초 + 여유 1초
     while (is_scanning && timeout > 0) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         timeout--;
     }
-    
+
     is_scanning = false;
-    
+
     ESP_LOGI(TAG, "=== 스캔 완료: 발견된 디바이스 %d개 ===", scanned_device_count);
     
     return scanned_device_count;
@@ -1093,12 +1355,20 @@ int ble_device_connect_multiple(void) {
     
     int connected_count = 0;
     
-    // 각 디바이스에 순차적으로 연결 시도
+    // 각 디바이스에 순차적으로 연결 시도 (Bluedroid ACL 상한 = CONFIG_BT_ACL_CONNECTIONS)
     for (int i = 0; i < scanned_device_count; i++) {
         if (scanned_devices[i].is_used) {
             continue; // 이미 연결된 디바이스는 스킵
         }
-        
+
+#ifdef CONFIG_BT_ACL_CONNECTIONS
+        if (active_connections >= CONFIG_BT_ACL_CONNECTIONS) {
+            ESP_LOGW(TAG, "ACL 동시 연결 상한(%d) 도달 — [스캔 %d개 중] 나머지는 연결하지 않음",
+                     CONFIG_BT_ACL_CONNECTIONS, scanned_device_count);
+            break;
+        }
+#endif
+
         uint8_t* mac = scanned_devices[i].mac_address;
         esp_ble_addr_type_t addr_type = scanned_devices[i].addr_type;
         char mac_str[18];
@@ -1124,8 +1394,8 @@ int ble_device_connect_multiple(void) {
             continue;
         }
         
-        // 연결 완료 대기 (최대 15초)
-        int timeout = 20;
+        /* 연결 완료 대기 (500ms * 30 = 15s — 다중 연결·RF 혼잡 시 이전 10s는 부족할 수 있음) */
+        int timeout = 30;
         while (conn->is_connecting && !conn->is_connected && timeout > 0) {
             vTaskDelay(pdMS_TO_TICKS(500));
             timeout--;
@@ -1140,9 +1410,9 @@ int ble_device_connect_multiple(void) {
             conn->is_connecting = false;
         }
         
-        // 다음 연결 전 짧은 대기 (연결 안정화)
+        /* 다중 연결 시 RF·힙 경합 완화 (이전 1s는 부족한 경우 타임아웃·링크 드롭 유발) */
         if (i < scanned_device_count - 1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(1500));
         }
     }
     
@@ -1174,11 +1444,11 @@ void ble_device_disconnect(void) {
     if (ble_device_is_init) {
         ESP_LOGI(TAG, "BLE 초기화 해제");
         
-        // BT 스택 해제 (간단하게)
         esp_bluedroid_disable();
-        esp_bt_controller_disable();
-        esp_bt_controller_deinit();
-        
+        esp_bluedroid_deinit();
+        (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+        /* 컨트롤러는 유지 — 이후 GATT 서버(ble_init)와 동일 정책 */
+
         ble_device_is_init = false;
     }
     
@@ -1296,16 +1566,18 @@ void ble_info_print(void) {
 
         // 서비스 범위 내 특성/디스크립터 상세 나열 (NUS 또는 현재 선택된 서비스)
         if (g_service_start != 0 && g_service_end != 0) {
-            // Characteristic 나열
+            /* 디버그 출력용 — malloc 제거(다중 연결 시 힙 압박 완화), 최대 24개까지만 표시 */
+            #define BLE_INFO_CHAR_CAP 24
+            #define BLE_INFO_DESCR_CAP 12
             uint16_t ccount = 0;
             if (esp_ble_gattc_get_attr_count(s_gattc_if, g_conn_id,
                     ESP_GATT_DB_CHARACTERISTIC, g_service_start, g_service_end, 0, &ccount) == ESP_GATT_OK && ccount > 0) {
-                esp_gattc_char_elem_t *chars = (esp_gattc_char_elem_t*)malloc(sizeof(esp_gattc_char_elem_t) * ccount);
-                if (chars) {
-                    if (esp_ble_gattc_get_all_char(s_gattc_if, g_conn_id,
-                            g_service_start, g_service_end, chars, &ccount, 0) == ESP_OK) {
-                        ESP_LOGI(TAG, "특성 %d개:", ccount);
-                        for (int i = 0; i < ccount; i++) {
+                uint16_t cap = (ccount > BLE_INFO_CHAR_CAP) ? BLE_INFO_CHAR_CAP : ccount;
+                esp_gattc_char_elem_t chars[BLE_INFO_CHAR_CAP];
+                if (esp_ble_gattc_get_all_char(s_gattc_if, g_conn_id,
+                            g_service_start, g_service_end, chars, &cap, 0) == ESP_OK) {
+                        ESP_LOGI(TAG, "특성 %u개 (표시 최대 %d):", (unsigned)cap, BLE_INFO_CHAR_CAP);
+                        for (int i = 0; i < cap; i++) {
                             esp_bt_uuid_t cuid = chars[i].uuid;
                             // UUID 출력
                             if (cuid.len == ESP_UUID_LEN_16) {
@@ -1326,11 +1598,11 @@ void ble_info_print(void) {
                             uint16_t dcount = 0;
                             if (esp_ble_gattc_get_attr_count(s_gattc_if, g_conn_id,
                                     ESP_GATT_DB_DESCRIPTOR, g_service_start, g_service_end, chars[i].char_handle, &dcount) == ESP_GATT_OK && dcount > 0) {
-                                esp_gattc_descr_elem_t *descrs = (esp_gattc_descr_elem_t*)malloc(sizeof(esp_gattc_descr_elem_t) * dcount);
-                                if (descrs) {
-                                    if (esp_ble_gattc_get_all_descr(s_gattc_if, g_conn_id, chars[i].char_handle,
-                                            descrs, &dcount, 0) == ESP_OK) {
-                                        for (int j = 0; j < dcount; j++) {
+                                uint16_t dcap = (dcount > BLE_INFO_DESCR_CAP) ? BLE_INFO_DESCR_CAP : dcount;
+                                esp_gattc_descr_elem_t descrs[BLE_INFO_DESCR_CAP];
+                                if (esp_ble_gattc_get_all_descr(s_gattc_if, g_conn_id, chars[i].char_handle,
+                                            descrs, &dcap, 0) == ESP_OK) {
+                                        for (int j = 0; j < dcap; j++) {
                                             if (descrs[j].uuid.len == ESP_UUID_LEN_16) {
                                                 ESP_LOGI(TAG, "     · descr handle:%u uuid16:0x%04x",
                                                          (unsigned)descrs[j].handle, descrs[j].uuid.uuid.uuid16);
@@ -1344,13 +1616,9 @@ void ble_info_print(void) {
                                                          du[15],du[14],du[13],du[12], du[11],du[10], du[9],du[8], du[7],du[6], du[5],du[4],du[3],du[2],du[1],du[0]);
                                             }
                                         }
-                                    }
-                                    free(descrs);
                                 }
                             }
                         }
-                    }
-                    free(chars);
                 }
             } else {
                 ESP_LOGI(TAG, "특성 없음 (서비스 범위 내)");

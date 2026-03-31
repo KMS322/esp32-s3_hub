@@ -4,6 +4,9 @@
 #include "esp_err.h"
 #include <stdbool.h>
 
+/** Wi-Fi 기동 전 BT 컨트롤러만 활성화 — Wi-Fi 연결 후 첫 enable 시 emi/WDT 회피 */
+esp_err_t ble_controller_early_init(void);
+
 // 전역 변수 선언 (외부 접근 가능)
 extern uint8_t found_device_mac[6];
 extern bool device_found;
@@ -20,8 +23,11 @@ bool ble_device_is_init_func(void);
 // 반환값: 찾았으면 true, 못 찾으면 false (최대 10초)
 bool ble_device_scan(const char* device_name, const char* mac_address);
 
+/** "aa:bb:cc:dd:ee:ff" 형식 검증 후 소문자로 out18에 저장 */
+bool ble_device_validate_mac_string(const char *mac_str, char out18[18]);
+
 // 다중 연결용 스캔 함수 - 모든 타겟 디바이스를 리스트로 수집
-// device_name: 디바이스 이름 (예: "Tailing")
+// device_name: 디바이스 이름 (예: "Tailing"); NULL 또는 "" 이면 이름 필터 없음
 // mac_addresses: MAC 주소 배열 (NULL 가능, 각 MAC 주소는 18바이트: "AA:BB:CC:DD:EE:FF\0")
 // mac_count: MAC 주소 배열의 개수 (0이면 이름만으로 필터링)
 // 반환값: 발견된 디바이스 개수

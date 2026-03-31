@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "sdkconfig.h"
 #include "stdarg.h"
 #include "string.h"
 #include "stdlib.h"
@@ -82,11 +83,6 @@ static void reset_device_batch_buffers(device_collector_t *device)
     memset(device->start_time, 0, sizeof(device->start_time));
 }
 
-// 최대 디바이스 개수 (여러 nrf5340 연결 대비)
-#define MAX_DEVICES 10
-#define DEVICE_SAMPLE_MAX 250
-#define DEVICE_SAMPLE_STR_MAX 96
-
 // 디버깅용: 총 데이터 수신 카운터
 static int g_total_data_received = 0;
 /* 고정 슬롯 힙 풀: 런타임 1회 할당(반복 malloc/free 제거 + .bss 절감) */
@@ -136,7 +132,12 @@ esp_err_t device_collector_init(void) {
 
     size_t pool_size = (size_t)MAX_DEVICES * DEVICE_SAMPLE_MAX * DEVICE_SAMPLE_STR_MAX;
     if (g_sample_pool == NULL) {
-        g_sample_pool = (char *)heap_caps_malloc(pool_size, MALLOC_CAP_8BIT);
+#if CONFIG_SPIRAM
+        g_sample_pool = (char *)heap_caps_malloc(pool_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+        if (g_sample_pool == NULL) {
+            g_sample_pool = (char *)heap_caps_malloc(pool_size, MALLOC_CAP_8BIT);
+        }
         if (g_sample_pool == NULL) {
             ESP_LOGE(TAG, "샘플 풀 할당 실패 (%u bytes)", (unsigned)pool_size);
             return ESP_ERR_NO_MEM;
@@ -158,7 +159,12 @@ esp_err_t device_collector_init(void) {
     is_initialized = true;
     /* 고정 버퍼 1회 선할당: 실행 중 가변 할당/파편화 최소화 */
     if (g_json_work_buf == NULL) {
-        g_json_work_buf = (char *)heap_caps_malloc(JSON_FIXED_BUF_SIZE, MALLOC_CAP_8BIT);
+#if CONFIG_SPIRAM
+        g_json_work_buf = (char *)heap_caps_malloc(JSON_FIXED_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+        if (g_json_work_buf == NULL) {
+            g_json_work_buf = (char *)heap_caps_malloc(JSON_FIXED_BUF_SIZE, MALLOC_CAP_8BIT);
+        }
     }
     if (g_json_work_buf == NULL) {
         ESP_LOGW(TAG, "JSON 고정 버퍼 선할당 실패(%d B), 런타임 전송 실패 가능", JSON_FIXED_BUF_SIZE);
@@ -241,10 +247,11 @@ esp_err_t device_collector_create_device(const uint8_t* mac_address) {
     device->gyro = 0;
     memset(device->start_time, 0, sizeof(device->start_time));
 
-    // device_data 배열 초기화 (250개로 변경)
+    // device_data 배열 초기화 (고정 풀 슬롯과 연결)
     for (int i = 0; i < DEVICE_SAMPLE_MAX; i++) {
-        g_device_sample_slots[slot][i][0] = '\0';
-        device->device_data[i] = g_device_sample_slots[slot][i];
+        char *p = sample_slot_ptr(slot, i);
+        p[0] = '\0';
+        device->device_data[i] = p;
     }
 
     char mac_str[18];
@@ -487,12 +494,7 @@ esp_err_t device_collector_remove_device(const uint8_t* mac_address) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    // 데이터 슬롯 초기화 (고정 슬롯 방식)
-    for (int i = 0; i < DEVICE_SAMPLE_MAX; i++) {
-        if (device->device_data[i] != NULL) {
-            device->device_data[i][0] = '\0';
-        }
-    }
+    int slot = (int)(device - devices);
 
     char mac_str[18];
     device_collector_mac_to_string(mac_address, mac_str);
@@ -500,12 +502,14 @@ esp_err_t device_collector_remove_device(const uint8_t* mac_address) {
     ESP_LOGI(TAG, "MAC 주소: %s", mac_str);
     ESP_LOGI(TAG, "제거된 데이터 개수: %d", device->data_count);
 
-    // 디바이스 초기화
+    // 디바이스 초기화 및 해당 슬롯 풀 문자열 비우기
     device->is_active = false;
     device->data_count = 0;
     memset(device->mac_address, 0, 6);
     for (int i = 0; i < DEVICE_SAMPLE_MAX; i++) {
-        device->device_data[i] = g_device_sample_slots[(int)(device - devices)][i];
+        char *p = sample_slot_ptr(slot, i);
+        p[0] = '\0';
+        device->device_data[i] = p;
     }
 
     ESP_LOGI(TAG, "=========================");

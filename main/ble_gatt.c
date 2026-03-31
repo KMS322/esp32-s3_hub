@@ -4,7 +4,6 @@
 #include "wifi_manager.h"
 #include "http_client.h"
 #include "esp_log.h"
-#include "esp_log_buffer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "string.h"
@@ -382,20 +381,24 @@ esp_err_t ble_init(void)
 
     ESP_LOGI(TAG, "=== BLE 초기화 시작 ===");
 
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
     esp_log_level_set("BLE_INIT", ESP_LOG_NONE);
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ret = esp_bt_controller_init(&bt_cfg);
-    if (ret) {
-        ESP_LOGE(TAG, "%s initialize controller failed: %s\n", __func__, esp_err_to_name(ret));
-        return ret;
-    }
 
-    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret) {
-        ESP_LOGE(TAG, "%s enable controller failed: %s\n", __func__, esp_err_to_name(ret));
-        return ret;
+    esp_bt_controller_status_t cst = esp_bt_controller_get_status();
+    if (cst == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+        ret = esp_bt_controller_init(&bt_cfg);
+        if (ret) {
+            ESP_LOGE(TAG, "%s initialize controller failed: %s\n", __func__, esp_err_to_name(ret));
+            return ret;
+        }
+        ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        if (ret) {
+            ESP_LOGE(TAG, "%s enable controller failed: %s\n", __func__, esp_err_to_name(ret));
+            return ret;
+        }
+    } else {
+        ESP_LOGI(TAG, "BT 컨트롤러 이미 활성(status=%d) — RF 재초기화 생략", (int)cst);
     }
 
     ret = esp_bluedroid_init();
@@ -529,34 +532,11 @@ esp_err_t ble_complete_deinit(void) {
     } else {
         ESP_LOGI(TAG, "Bluedroid 해제 완료");
     }
-    
-    // 3. BT 컨트롤러 비활성화
-    ret = esp_bt_controller_disable();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "BT 컨트롤러 비활성화 경고: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "BT 컨트롤러 비활성화 완료");
-    }
-    
-    // 컨트롤러 비활성화 대기
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // 4. BT 컨트롤러 해제
-    ret = esp_bt_controller_deinit();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "BT 컨트롤러 해제 경고: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "BT 컨트롤러 해제 완료");
-    }
-    // 4-1. Classic BT 메모리 해제(선택, 권장)
-    ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "Classic BT 메모리 해제 경고: %s", esp_err_to_name(ret));
-    }
-    
-    // 최종 안정화 대기
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
+
+    /* Wi-Fi 유지 상태에서 BLE 클라이언트로 넘길 때: BT 컨트롤러(RF)는 유지.
+     * 컨트롤러 disable/deinit 시 이후 재진입에서 emi.c assert + IWDT가 난 사례 있음. */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     ble_initialized = false;
     ESP_LOGI(TAG, "=== BLE 서버 완전 종료 완료 ===");
     
