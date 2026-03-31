@@ -383,6 +383,10 @@ static void hub_ble_scan_connect_task_fn(void *arg)
         goto task_done;
     }
 
+    /* LED_GUIDE.md: "스캔·연결 후"를 파랑 고정으로 잠깐 표시 */
+    hub_led_set_mode(HUB_LED_MODE_BLE_CONNECTED);
+    vTaskDelay(pdMS_TO_TICKS(800));
+
     for (int i = 0; i < n_macs && i < MAX_DEVICE_COUNT; i++) {
         strncpy(device_mac_addresses[i], connected_macs[i], 17);
         device_mac_addresses[i][17] = '\0';
@@ -486,9 +490,9 @@ void app_main(void)
     // delete_nvs(NVS_WIFI_PW);
     // delete_nvs(NVS_USER_EMAIL);
     // delete_nvs(NVS_MAC_ADDRESS);
-    save_nvs(NVS_WIFI_ID, "iptime");
-    save_nvs(NVS_WIFI_PW, "");
-    save_nvs(NVS_USER_EMAIL, "c@c.com");
+    // save_nvs(NVS_WIFI_ID, "iptime");
+    // save_nvs(NVS_WIFI_PW, "");
+    // save_nvs(NVS_USER_EMAIL, "d@d.com");
 
     // init_mac_address();
     // const char* local_mac_address = get_mac_address();
