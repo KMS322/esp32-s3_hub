@@ -303,18 +303,58 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
         if (*p == ',') comma_count++;
     }
 
-    // 첫 데이터 수신 시 타임스탬프 기록
+    // 첫 데이터 수신 시 타임스탬프 기록 (MQTT JSON start_time: YYMMDD-HHmmssSSS)
     if (!device->has_start_time && device->data_count == 0) {
-        // 현재 시각을 HHmmssSSS 형식으로 저장
         struct timeval tv;
         gettimeofday(&tv, NULL);
         struct tm timeinfo;
         localtime_r(&tv.tv_sec, &timeinfo);
 
+        int y2 = (timeinfo.tm_year + 1900) % 100;
+        if (y2 < 0) {
+            y2 = 0;
+        }
+        int mo = timeinfo.tm_mon + 1;
+        if (mo < 1) {
+            mo = 1;
+        }
+        if (mo > 12) {
+            mo = 12;
+        }
+        int dd = timeinfo.tm_mday;
+        if (dd < 1) {
+            dd = 1;
+        }
+        if (dd > 31) {
+            dd = 31;
+        }
+        int hh = timeinfo.tm_hour % 24;
+        if (hh < 0) {
+            hh += 24;
+        }
+        int mi = timeinfo.tm_min % 60;
+        if (mi < 0) {
+            mi += 60;
+        }
+        int sc = timeinfo.tm_sec % 60;
+        if (sc < 0) {
+            sc += 60;
+        }
+        unsigned msec = (unsigned)(tv.tv_usec / 1000);
+        if (msec > 999u) {
+            msec = 999u;
+        }
+        /* GCC -Wformat-truncation: tm_* 타입이 int라 정적 분석이 과대평가 — 실제 출력은 16+NUL */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
         snprintf(device->start_time, sizeof(device->start_time),
-                 "%02d%02d%02d%03d",
-                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
-                 (int)(tv.tv_usec / 1000));
+                 "%02d%02d%02d-%02d%02d%02d%03u",
+                 y2, mo, dd, hh, mi, sc, msec);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
         device->has_start_time = true;
         ESP_LOGI(TAG, "[%s] 첫 데이터 수신 - start_time: %s", mac_str, device->start_time);
     }
@@ -373,6 +413,11 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
             ESP_LOGI(TAG, "  temp: %.1f", device->temp);
             ESP_LOGI(TAG, "  battery: %d", device->battery);
             ESP_LOGI(TAG, "  gyro: %d", device->gyro);
+            if (device->has_start_time && device->start_time[0] != '\0') {
+                ESP_LOGI(TAG, "  start_time(MQTT JSON): %s", device->start_time);
+            } else {
+                ESP_LOGW(TAG, "  start_time: (미설정)");
+            }
         } else {
             ESP_LOGE(TAG, "[%s] 메타데이터 파싱 실패: %s", mac_str, data_copy);
             return ESP_ERR_INVALID_ARG;
@@ -387,6 +432,8 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
         ESP_LOGI(TAG, "=== [%s] 데이터 %d개 + 메타데이터 수집 완료! ===", mac_str, device->data_count);
         bool batch_reset = false;
         int sent_data_count = device->data_count;
+        /* reset_device_batch_buffers()가 MQTT 전에 start_time을 지우므로 발행 로그용 복사 */
+        char mqtt_start_time_snap[20] = {0};
 
         // 1단계: JSON 생성 — 고정 버퍼 사용
         char* json_data = g_json_work_buf;
@@ -397,7 +444,7 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)esp_get_minimum_free_heap_size());
         } else {
-            // JSON: HR, Spo2, Temp(소수 첫째자리), Battery, Gyro + data 배열 + start_time
+            // JSON: HR, Spo2, Temp(소수 첫째자리), Battery, Gyro + data 배열 + start_time(YYMMDD-HHmmssSSS)
             size_t offset = 0;
             bool json_ok = json_appendf(json_data, json_size, &offset,
                                         "{\"device_mac_address\":\"%s\","
@@ -435,8 +482,12 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
             }
 
             // 2단계: JSON 생성 완료 후, BT 힙 보호를 위해 샘플 버퍼를 먼저 반환
-            ESP_LOGI(TAG, "[%s] JSON 생성 완료 (%u bytes, 데이터 %d개)", mac_str, (unsigned)offset, sent_data_count);
+            ESP_LOGI(TAG, "[%s] JSON 생성 완료 (%u bytes, 데이터 %d개, start_time=%s)", mac_str,
+                     (unsigned)offset, sent_data_count,
+                     (device->start_time[0] != '\0') ? device->start_time : "-");
             if (json_ok) {
+                strncpy(mqtt_start_time_snap, device->start_time, sizeof(mqtt_start_time_snap) - 1);
+                mqtt_start_time_snap[sizeof(mqtt_start_time_snap) - 1] = '\0';
                 reset_device_batch_buffers(device);
                 batch_reset = true;
             }
@@ -447,8 +498,9 @@ esp_err_t device_collector_add_data(const uint8_t* mac_address, const char* data
 
                 esp_err_t mqtt_ret = mqtt_send_data(mqtt_topic, json_data);
                 if (mqtt_ret == ESP_OK) {
-                    ESP_LOGI(TAG, "[%s] MQTT 전송 성공 - 토픽: %s, data.length: %d",
-                             mac_str, mqtt_topic, sent_data_count);
+                    ESP_LOGI(TAG, "[%s] MQTT 전송 성공 - 토픽: %s, data.length: %d, start_time: %s",
+                             mac_str, mqtt_topic, sent_data_count,
+                             (mqtt_start_time_snap[0] != '\0') ? mqtt_start_time_snap : "-");
                 } else {
                     ESP_LOGE(TAG, "[%s] MQTT 전송 실패: %s", mac_str, esp_err_to_name(mqtt_ret));
                 }

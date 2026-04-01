@@ -4,11 +4,11 @@ if(CONFIG_SPIRAM)
 endif()
 
 set(MAIN_SRCS
-    "hub_led.c" "usb.c" "mqtt.c" "device_collector.c" "ble_device.c" "gpio_control.c"
+    "hub_sntp.c" "hub_led.c" "usb.c" "mqtt.c" "device_collector.c" "ble_device.c" "gpio_control.c"
     "ble_client.c" "nvs_manager.c" "main.c" "http_client.c" "ble_gatt.c" "wifi_manager.c"
     "web_socket.c")
 if(CONFIG_SPIRAM)
-    list(APPEND MAIN_SRCS "psram_impl_enable_wrap.c")
+    list(APPEND MAIN_SRCS "hub_sntp.c" "psram_impl_enable_wrap.c")
 endif()
 
 idf_component_register(SRCS ${MAIN_SRCS}

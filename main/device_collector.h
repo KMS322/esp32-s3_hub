@@ -18,8 +18,8 @@ typedef struct {
     int battery;
     int gyro;
 
-    // 타임스탬프 (첫 데이터 수신 시각)
-    char start_time[16];            // HHmmssSSS 형식 (여유 공간 포함)
+    // 타임스탬프 (첫 데이터 수신 시각) — YYMMDD-HHmmssSSS 예: 260401-041457308
+    char start_time[20];
     bool has_start_time;
 
     bool is_active;                 // 활성 상태 플래그

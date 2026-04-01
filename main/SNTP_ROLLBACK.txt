@@ -1,0 +1,13 @@
+SNTP 끄기 (이전처럼 시각 동기 없음)
+====================================
+1) main/hub_sntp.h 파일에서
+   #define HUB_SNTP_ENABLED 1
+   를
+   #define HUB_SNTP_ENABLED 0
+   으로 바꾼 뒤 idf.py build flash 합니다.
+
+2) hub_sntp_after_wifi_got_ip() 는 즉시 아무 것도 하지 않습니다.
+   main.c 의 호출 줄은 그대로 두어도 동작에는 영향 없습니다.
+
+3) 완전히 소스에서 제거하고 싶다면(선택): hub_sntp.c 를 CMakeLists MAIN_SRCS 에서 빼고,
+   hub_sntp.h include 및 hub_sntp_after_wifi_got_ip(...) 호출을 삭제합니다.

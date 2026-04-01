@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,6 +32,7 @@
 // GPIO 제어
 #include "gpio_control.h"
 #include "hub_led.h"
+#include "hub_sntp.h" /* 비활성: hub_sntp.h 의 HUB_SNTP_ENABLED 를 0 */
 // 디바이스 수집기
 #include "device_collector.h"
 // USB 통신
@@ -106,6 +108,13 @@ static bool usb_connected_message_sent = false;
 static char usb_wifi_id[64] = {0};
 static char usb_wifi_pw[64] = {0};
 static char usb_user_email[128] = {0};
+
+/** USB 분할 전송: s:… / (중간 줄) / e:… → id,pw,email 한 줄로 조립 */
+#define HUB_USB_WIFI_ASSEMBLY_CAP 768
+static char s_usb_wifi_asm[HUB_USB_WIFI_ASSEMBLY_CAP];
+static size_t s_usb_wifi_asm_len;
+static bool s_usb_wifi_asm_open;
+static unsigned s_usb_wifi_part_idx;
 
 typedef enum {
     STATE_HUB_INIT,
@@ -588,9 +597,159 @@ static bool hub_wait_mqtt_until_connected(uint32_t timeout_ms)
     return mqtt_is_connected();
 }
 
+static void hub_usb_wifi_asm_reset(void)
+{
+    s_usb_wifi_asm[0] = '\0';
+    s_usb_wifi_asm_len = 0;
+    s_usb_wifi_asm_open = false;
+    s_usb_wifi_part_idx = 0;
+}
+
+/** 분석용: 긴 문자열을 여러 로그 줄로 나눔(ESP 로그 한 줄 제한 대비) */
+static void hub_usb_log_chunked_utf8(const char *prefix, const char *text)
+{
+    if (text == NULL) {
+        ESP_LOGI(GATTS_TAG, "%s (null)", prefix);
+        return;
+    }
+    size_t len = strlen(text);
+    ESP_LOGI(GATTS_TAG, "%s 총 길이=%u bytes", prefix, (unsigned)len);
+    const size_t step = 240;
+    for (size_t off = 0; off < len; off += step) {
+        size_t n = len - off;
+        if (n > step) {
+            n = step;
+        }
+        ESP_LOGI(GATTS_TAG, "%s [%u..+%u) %.*s", prefix, (unsigned)off, (unsigned)n, (int)n, text + off);
+    }
+}
+
+static void hub_usb_trim_trailing_crlf(char *s)
+{
+    if (s == NULL) {
+        return;
+    }
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n')) {
+        s[--n] = '\0';
+    }
+}
+
+static bool hub_usb_wifi_asm_append(const char *chunk, size_t clen)
+{
+    if (chunk == NULL || clen == 0) {
+        return true;
+    }
+    if (s_usb_wifi_asm_len + clen >= HUB_USB_WIFI_ASSEMBLY_CAP) {
+        ESP_LOGE(GATTS_TAG, "USB WiFi 조립 버퍼 초과 (%u바이트) — 조립 취소", (unsigned)HUB_USB_WIFI_ASSEMBLY_CAP);
+        hub_usb_wifi_asm_reset();
+        return false;
+    }
+    memcpy(s_usb_wifi_asm + s_usb_wifi_asm_len, chunk, clen);
+    s_usb_wifi_asm_len += clen;
+    s_usb_wifi_asm[s_usb_wifi_asm_len] = '\0';
+    return true;
+}
+
+/** 조립된 문자열을 쉼표 2개 기준으로 id / pw / email 파싱 (OPEN은 pw 빈 문자열 허용) */
+static bool hub_usb_wifi_parse_assembled_csv(const char *assembled)
+{
+    const char *c1 = strchr(assembled, ',');
+    if (c1 == NULL) {
+        ESP_LOGW(GATTS_TAG, "USB WiFi 조립본에 쉼표 없음");
+        return false;
+    }
+    const char *c2 = strchr(c1 + 1, ',');
+    if (c2 == NULL) {
+        ESP_LOGW(GATTS_TAG, "USB WiFi 조립본에 쉼표 2개 미만");
+        return false;
+    }
+    size_t id_len = (size_t)(c1 - assembled);
+    size_t pw_len = (size_t)(c2 - (c1 + 1));
+    size_t em_len = strlen(c2 + 1);
+    if (id_len == 0 || em_len == 0) {
+        ESP_LOGW(GATTS_TAG, "USB WiFi: SSID 또는 이메일이 비어 있음");
+        return false;
+    }
+    if (id_len >= sizeof(usb_wifi_id) || pw_len >= sizeof(usb_wifi_pw) || em_len >= sizeof(usb_user_email)) {
+        ESP_LOGW(GATTS_TAG, "USB WiFi: 필드 길이 초과 (id<64, pw<64, email<128)");
+        return false;
+    }
+    memset(usb_wifi_id, 0, sizeof(usb_wifi_id));
+    memset(usb_wifi_pw, 0, sizeof(usb_wifi_pw));
+    memset(usb_user_email, 0, sizeof(usb_user_email));
+    memcpy(usb_wifi_id, assembled, id_len);
+    memcpy(usb_wifi_pw, c1 + 1, pw_len);
+    memcpy(usb_user_email, c2 + 1, em_len);
+    ESP_LOGI(GATTS_TAG, "USB WiFi 파싱 결과 — SSID=\"%s\"", usb_wifi_id);
+    ESP_LOGI(GATTS_TAG, "USB WiFi 파싱 결과 — PW=\"%s\" (len=%u)", usb_wifi_pw, (unsigned)pw_len);
+    ESP_LOGI(GATTS_TAG, "USB WiFi 파싱 결과 — EMAIL=\"%s\"", usb_user_email);
+    return true;
+}
+
+/**
+ * USB 한 줄 처리. 완성 시 true 반환 → 호출부에서 STATE_WIFI_CONNECT_TRY 로 전환.
+ * 규약: s:첫조각 → (중간 줄 전체)* → e:마지막조각 → "id,pw,email"
+ */
+static bool hub_usb_line_wifi_account_assembly(char *line)
+{
+    hub_usb_trim_trailing_crlf(line);
+    if (line[0] == '\0') {
+        return false;
+    }
+
+    if (strncmp(line, "s:", 2) == 0) {
+        hub_usb_wifi_asm_reset();
+        s_usb_wifi_asm_open = true;
+        s_usb_wifi_part_idx = 1;
+        ESP_LOGI(GATTS_TAG, "USB WiFi 수신 순서 [%u] (s: 본문)", s_usb_wifi_part_idx);
+        hub_usb_log_chunked_utf8("  └", line + 2);
+        if (!hub_usb_wifi_asm_append(line + 2, strlen(line + 2))) {
+            return false;
+        }
+        return false;
+    }
+
+    if (strncmp(line, "e:", 2) == 0) {
+        if (!s_usb_wifi_asm_open) {
+            ESP_LOGW(GATTS_TAG, "USB WiFi: e: 수신이나 s: 없음 — 무시");
+            return false;
+        }
+        s_usb_wifi_part_idx++;
+        ESP_LOGI(GATTS_TAG, "USB WiFi 수신 순서 [%u] (e: 본문)", s_usb_wifi_part_idx);
+        hub_usb_log_chunked_utf8("  └", line + 2);
+        if (!hub_usb_wifi_asm_append(line + 2, strlen(line + 2))) {
+            return false;
+        }
+        ESP_LOGI(GATTS_TAG, "USB WiFi — 모든 조각 수신 완료, 최종 조립 문자열:");
+        hub_usb_log_chunked_utf8("  [FINAL]", s_usb_wifi_asm);
+        if (!hub_usb_wifi_parse_assembled_csv(s_usb_wifi_asm)) {
+            hub_usb_wifi_asm_reset();
+            return false;
+        }
+        hub_usb_wifi_asm_reset();
+        return true;
+    }
+
+    if (s_usb_wifi_asm_open) {
+        s_usb_wifi_part_idx++;
+        ESP_LOGI(GATTS_TAG, "USB WiFi 수신 순서 [%u] (중간 줄)", s_usb_wifi_part_idx);
+        hub_usb_log_chunked_utf8("  └", line);
+        if (!hub_usb_wifi_asm_append(line, strlen(line))) {
+            return false;
+        }
+        return false;
+    }
+
+    return false;
+}
+
 void app_main(void)
 {
     ESP_LOGI(GATTS_TAG, "=== 허브 시작 ===");
+    /* SNTP는 UTC로 동기화. localtime_r/strftime/device_collector start_time은 TZ 기준 — 한국(UTC+9, DST 없음) */
+    setenv("TZ", "KST-9", 1);
+    tzset();
     ESP_ERROR_CHECK(hub_nvs_flash_init());
     ESP_ERROR_CHECK(gpio_control_init());
     hub_led_init(HUB_LED_DEFAULT_BRIGHTNESS);
@@ -611,7 +770,7 @@ void app_main(void)
     // delete_nvs(NVS_MAC_ADDRESS);
     // save_nvs(NVS_WIFI_ID, "iptime");
     // save_nvs(NVS_WIFI_PW, "");
-    // save_nvs(NVS_USER_EMAIL, "d@d.com");
+    // save_nvs(NVS_USER_EMAIL, "c@c.com");
 
     // init_mac_address();
     // const char* local_mac_address = get_mac_address();
@@ -1099,6 +1258,7 @@ void app_main(void)
                     if(wifi_connected) {
                         ESP_LOGI(GATTS_TAG, "WiFi 연결 성공! IP 주소: %s", wifi_ip_address);
                         nvs_wifi_retry_count = 0; // 성공 시 재시도 카운터 리셋
+                        hub_sntp_after_wifi_got_ip(wifi_ip_address, sizeof(wifi_ip_address), GATTS_TAG);
                         current_state = STATE_MAC_ADDRESS_CHECK;
                     } else {
                         nvs_wifi_retry_count++;
@@ -1132,6 +1292,7 @@ void app_main(void)
                     }
                 } else {
                     // 이미 연결되어 있으면 다음 상태로
+                    hub_sntp_after_wifi_got_ip(wifi_ip_address, sizeof(wifi_ip_address), GATTS_TAG);
                     current_state = STATE_MAC_ADDRESS_CHECK;
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -1191,60 +1352,12 @@ void app_main(void)
                         static char received_data[2048];
                         size_t data_len = 0;
                         if (usb_get_received_data(received_data, sizeof(received_data), &data_len)) {
-                            // ESP_LOGI(GATTS_TAG, "USB 데이터 수신: %s (길이: %zu)", received_data, data_len);
-                            
-                            // "wifi"가 포함되어 있는지 확인
-                            if (strstr(received_data, "wifi") != NULL) {
-                                // "wifi:" 다음 부분 찾기
-                                char* wifi_prefix = strstr(received_data, "wifi:");
-                                if (wifi_prefix != NULL) {
-                                    char* data_start = wifi_prefix + 5; // "wifi:" 다음 위치
-                                    
-                                    // 첫 번째 쉼표 찾기 (WiFi ID)
-                                    char* comma1 = strchr(data_start, ',');
-                                    if (comma1 != NULL) {
-                                        size_t id_len = comma1 - data_start;
-                                        if (id_len < sizeof(usb_wifi_id)) {
-                                            memset(usb_wifi_id, 0, sizeof(usb_wifi_id));
-                                            strncpy(usb_wifi_id, data_start, id_len);
-                                            usb_wifi_id[id_len] = '\0';
-                                            
-                                            // 두 번째 쉼표 찾기 (WiFi PW)
-                                            char* comma2 = strchr(comma1 + 1, ',');
-                                            if (comma2 != NULL) {
-                                                size_t pw_len = comma2 - (comma1 + 1);
-                                                if (pw_len < sizeof(usb_wifi_pw)) {
-                                                    memset(usb_wifi_pw, 0, sizeof(usb_wifi_pw));
-                                                    strncpy(usb_wifi_pw, comma1 + 1, pw_len);
-                                                    usb_wifi_pw[pw_len] = '\0';
-                                                    
-                                                    // 나머지 부분 (User Email)
-                                                    char* email_start = comma2 + 1;
-                                                    // 개행 문자 제거
-                                                    char* newline = strchr(email_start, '\n');
-                                                    char* cr = strchr(email_start, '\r');
-                                                    char* end = email_start + strlen(email_start);
-                                                    if (newline != NULL && newline < end) end = newline;
-                                                    if (cr != NULL && cr < end) end = cr;
-                                                    
-                                                    size_t email_len = end - email_start;
-                                                    if (email_len < sizeof(usb_user_email)) {
-                                                        memset(usb_user_email, 0, sizeof(usb_user_email));
-                                                        strncpy(usb_user_email, email_start, email_len);
-                                                        usb_user_email[email_len] = '\0';
-                                                        
-                                                        ESP_LOGI(GATTS_TAG, "USB WiFi 데이터 파싱 완료 - ID: %s, PW: %s, Email: %s", 
-                                                                 usb_wifi_id, usb_wifi_pw, usb_user_email);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                retry_count = 0; // WiFi 연결 시도 전에 재시도 카운터 리셋
+                            /* s: / (중간 줄) / e: 분할 → id,pw,email 조립 후 Wi‑Fi 연결 시도 */
+                            if (hub_usb_line_wifi_account_assembly(received_data)) {
+                                retry_count = 0;
                                 hub_led_set_mode(HUB_LED_MODE_WIFI_CONNECTING);
                                 current_state = STATE_WIFI_CONNECT_TRY;
-                                ESP_LOGI(GATTS_TAG, "###### STATE_WIFI_CONNECT_TRY로 case 전환 ######");
+                                ESP_LOGI(GATTS_TAG, "###### STATE_WIFI_CONNECT_TRY로 전환 (USB 분할 WiFi) ######");
                             }
                         }
                         
@@ -1284,6 +1397,7 @@ void app_main(void)
                     ESP_LOGI(GATTS_TAG, "BLE WiFi 데이터 사용: ID=%s, PW=%s, Email=%s", wifi_id, wifi_pw, user_email);
                 } else {
                     ESP_LOGE(GATTS_TAG, "WiFi 정보가 없습니다");
+                    hub_usb_wifi_asm_reset();
                     current_state = STATE_USB_WAIT_ACCOUNT;
                     vTaskDelay(pdMS_TO_TICKS(1000));
                     break;
@@ -1295,6 +1409,7 @@ void app_main(void)
                     if (is_usb_mode) {
                         usb_send_data("wifi connect fail\n");
                         hub_led_set_mode(HUB_LED_MODE_USB_WAIT);
+                        hub_usb_wifi_asm_reset();
                         current_state = STATE_USB_WAIT_ACCOUNT;
                         ESP_LOGI(GATTS_TAG, "###### STATE_USB_WAIT_ACCOUNT로 case 전환 ######");
                     } else {
@@ -1386,12 +1501,16 @@ void app_main(void)
                                 strncpy(wifi_ip_address, ip_str, sizeof(wifi_ip_address) - 1);
                                 wifi_ip_address[sizeof(wifi_ip_address) - 1] = '\0';
                                 ESP_LOGI(GATTS_TAG, "IP 주소 확인 완료: %s", wifi_ip_address);
+                                /* DHCP 직후: Wi‑Fi 성공 시점에는 IP가 0.0.0.0일 수 있어 SNTP가 건너뛰어짐 → 여기서 보정 */
+                                hub_sntp_after_wifi_got_ip(wifi_ip_address, sizeof(wifi_ip_address), GATTS_TAG);
                             }
                         }
                         vTaskDelay(pdMS_TO_TICKS(2000)); // 2초 대기 후 재시도
                         break;
                     }
-                    
+
+                    hub_sntp_after_wifi_got_ip(wifi_ip_address, sizeof(wifi_ip_address), GATTS_TAG);
+
                     char json_data[256];
                     char clean_email[128];
                     char clean_mac[32];
@@ -1495,6 +1614,7 @@ void app_main(void)
                     wifi_connected = connect_to_wifi(wifi_id_from_nvs, wifi_pw_from_nvs, wifi_ip_address);
                     if(wifi_connected) {
                         ESP_LOGI(GATTS_TAG, "WiFi IP 주소: %s", wifi_ip_address);
+                        hub_sntp_after_wifi_got_ip(wifi_ip_address, sizeof(wifi_ip_address), GATTS_TAG);
                     }
                 }
                 vTaskDelay(pdMS_TO_TICKS(50));
