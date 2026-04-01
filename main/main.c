@@ -305,6 +305,125 @@ static int hub_count_bracket_csv_tokens(const char *param)
     return count;
 }
 
+/** 따옴표 밖에서만 ']' 탐색 (SSID/PW에 ]가 있어도 안전) */
+static const char *hub_find_bracket_close_outside_quotes(const char *start)
+{
+    bool in_quote = false;
+    for (const char *s = start; *s; s++) {
+        if (*s == '"') {
+            in_quote = !in_quote;
+        } else if (*s == ']' && !in_quote) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+/** 따옴표 밖에서만 ',' 탐색 */
+static const char *hub_find_comma_outside_quotes(const char *s)
+{
+    bool in_quote = false;
+    for (; *s; s++) {
+        if (*s == '"') {
+            in_quote = !in_quote;
+        } else if (*s == ',' && !in_quote) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+/** 앞뒤 공백 제거 후, 전체가 "…"로 감싸져 있으면 따옴표 제거해 out에 복사 */
+static bool hub_strip_quoted_csv_token(char *tok, char *out, size_t out_sz)
+{
+    char *s = tok;
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    char *end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t')) {
+        *--end = '\0';
+    }
+    size_t len = (size_t)(end - s);
+    if (len >= 2 && s[0] == '"' && s[len - 1] == '"') {
+        s++;
+        len -= 2;
+    }
+    if (len + 1 > out_sz) {
+        ESP_LOGW(GATTS_TAG, "reset_hub: 값 길이 초과 (최대 %zu바이트)", out_sz - 1);
+        return false;
+    }
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return true;
+}
+
+/** reset_hub:["wifi_id","wifi_pw"] — 서버는 따옴표로 감싸서 전송, NVS에는 따옴표 없이 저장 */
+#define HUB_RESET_WIFI_ID_MAX  64
+#define HUB_RESET_WIFI_PW_MAX  64
+
+static bool hub_parse_reset_hub_payload(const char *param, char *out_id, char *out_pw)
+{
+    if (!param) {
+        return false;
+    }
+    const char *p = param;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    char work[192];
+    if (p[0] != '[') {
+        ESP_LOGW(GATTS_TAG, "reset_hub: '['로 시작해야 함");
+        return false;
+    }
+    const char *close = hub_find_bracket_close_outside_quotes(p + 1);
+    if (!close) {
+        ESP_LOGW(GATTS_TAG, "reset_hub: ']' 없음");
+        return false;
+    }
+    size_t wlen = (size_t)(close - (p + 1));
+    if (wlen >= sizeof(work)) {
+        wlen = sizeof(work) - 1;
+    }
+    memcpy(work, p + 1, wlen);
+    work[wlen] = '\0';
+
+    char *nl = strchr(work, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
+    char *cr = strchr(work, '\r');
+    if (cr) {
+        *cr = '\0';
+    }
+
+    const char *comma = hub_find_comma_outside_quotes(work);
+    if (!comma) {
+        ESP_LOGW(GATTS_TAG, "reset_hub: 쉼표로 구분된 2필드 필요");
+        return false;
+    }
+    size_t len1 = (size_t)(comma - work);
+    size_t len2 = strlen(comma + 1);
+    char tok1[HUB_RESET_WIFI_ID_MAX + 4];
+    char tok2[HUB_RESET_WIFI_PW_MAX + 4];
+    if (len1 >= sizeof(tok1) || len2 >= sizeof(tok2)) {
+        ESP_LOGW(GATTS_TAG, "reset_hub: 필드 원문 너무 김");
+        return false;
+    }
+    memcpy(tok1, work, len1);
+    tok1[len1] = '\0';
+    memcpy(tok2, comma + 1, len2);
+    tok2[len2] = '\0';
+
+    if (!hub_strip_quoted_csv_token(tok1, out_id, HUB_RESET_WIFI_ID_MAX)) {
+        return false;
+    }
+    if (!hub_strip_quoted_csv_token(tok2, out_pw, HUB_RESET_WIFI_PW_MAX)) {
+        return false;
+    }
+    return true;
+}
+
 uint8_t target_macs[][6] = {
     {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC},  // 첫 번째 MAC
     {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56}   // 두 번째 MAC
@@ -721,6 +840,40 @@ void app_main(void)
                                 mqtt_ready_sent = false;
                                 current_state = STATE_HUB_INIT;
                                 ESP_LOGI(GATTS_TAG, "delete: STATE_HUB_INIT으로 복귀 (부팅과 동일 분기)");
+                            }
+                        } else if (strcmp(cmd, "reset_hub") == 0) {
+                            char new_id[HUB_RESET_WIFI_ID_MAX];
+                            char new_pw[HUB_RESET_WIFI_PW_MAX];
+                            if (!hub_parse_reset_hub_payload(colon_pos + 1, new_id, new_pw)) {
+                                ESP_LOGW(GATTS_TAG, "reset_hub: 파싱 실패");
+                            } else {
+                                esp_err_t e1 = save_nvs(NVS_WIFI_ID, new_id);
+                                esp_err_t e2 = save_nvs(NVS_WIFI_PW, new_pw);
+                                if (e1 != ESP_OK || e2 != ESP_OK) {
+                                    ESP_LOGE(GATTS_TAG, "reset_hub: NVS 저장 실패 id=%s pw=%s",
+                                             esp_err_to_name(e1), esp_err_to_name(e2));
+                                } else {
+                                    ESP_LOGI(GATTS_TAG, "reset_hub: NVS 갱신 완료 (id 길이=%zu, pw 길이=%zu)",
+                                             strlen(new_id), strlen(new_pw));
+                                    if (wifi_id_from_nvs != NULL) {
+                                        free(wifi_id_from_nvs);
+                                        wifi_id_from_nvs = NULL;
+                                    }
+                                    if (wifi_pw_from_nvs != NULL) {
+                                        free(wifi_pw_from_nvs);
+                                        wifi_pw_from_nvs = NULL;
+                                    }
+                                    memset(wifi_ip_address, 0, sizeof(wifi_ip_address));
+                                    if (is_wifi_initialized()) {
+                                        esp_err_t wd = esp_wifi_disconnect();
+                                        ESP_LOGI(GATTS_TAG, "reset_hub: esp_wifi_disconnect -> %s",
+                                                 esp_err_to_name(wd));
+                                    }
+                                    (void)mqtt_deinit();
+                                    mqtt_ready_sent = false;
+                                    current_state = STATE_HUB_INIT;
+                                    ESP_LOGI(GATTS_TAG, "reset_hub: STATE_HUB_INIT으로 복귀 (새 Wi‑Fi 적용)");
+                                }
                             }
                         } else if(strcmp(cmd, "disconnect") == 0) {
                             if (extract_mac_address(colon_pos + 1, target_device_mac_address,
